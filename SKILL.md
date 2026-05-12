@@ -71,7 +71,11 @@ Python script  ─►  bridge_client.BridgePage
    > 1. Open `chrome://extensions`
    > 2. Toggle "Developer mode" (top right)
    > 3. Click "Load unpacked" and select `<this-skill>/extension/`
-   > 4. Confirm it's enabled, then tell me "ready"
+   > 4. On the extension card, click **Details** → set **Site access** to
+   >    **"On all sites"**. Chrome 112+ requires this for `cookies.getAll`
+   >    and cross-site DOM operations to work, even though the manifest
+   >    declares `<all_urls>`.
+   > 5. Confirm it's enabled, then tell me "ready"
    >
    > After that the extension auto-connects to ws://localhost:9333 on every
    > Chrome start; you won't see this again.
@@ -156,9 +160,21 @@ python scripts/watch_reload.py --once
 
 ## Permissions
 
-`<all_urls>` is requested in `manifest.json`, so the extension can operate
-on every page. After install or any extension upgrade, reload the extension
-once in `chrome://extensions` so Chrome re-grants the wildcard.
+`<all_urls>` is requested in `manifest.json`, but **Chrome 112+ won't grant
+it implicitly**. The user must open the extension's **Details** in
+`chrome://extensions` and set **Site access → "On all sites"**. Without
+this:
+
+- `navigate` / `evaluate` / `click_element` still work on the active tab
+  (via `activeTab` permission), but
+- `chrome.cookies.getAll({})` silently returns cookies only for the
+  specific domains the user has individually granted, and
+- `executeScript` may fail on tabs that weren't user-activated.
+
+Only one Chrome Bridge extension should be loaded at a time. If two are
+present (e.g. an old copy from another project) they both connect to
+`ws://localhost:9333` and the relay routes commands to whichever connected
+last — behavior becomes non-deterministic.
 
 ## References
 

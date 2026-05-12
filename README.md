@@ -44,6 +44,10 @@ pip install websockets        # or: uv pip install websockets
 #   1. open chrome://extensions
 #   2. enable "Developer mode" (top right)
 #   3. "Load unpacked" → select the `extension/` directory
+#   4. on the extension card, click "Details" → set
+#      "Site access" to "On all sites"
+#      (Chrome 112+ requires this; without it `cookies.getAll`
+#      and cross-site scripting silently return empty/partial results)
 ```
 
 Requirements:
