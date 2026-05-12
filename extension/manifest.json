@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Bridge",
+  "version": "1.0.3",
+  "description": "Bridge between a local Python client and Chrome — browser automation that reuses your real, signed-in profile.",
+  "permissions": [
+    "tabs",
+    "cookies",
+    "scripting",
+    "alarms",
+    "debugger",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "ws://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
