@@ -1,11 +1,11 @@
 ---
-name: chrome-bridge
-description: Browser automation that drives the user's real Chrome (with their logins, cookies, and SPA state) from Python. Use when an agent needs to scrape a logged-in page, click through a SPA, fill a form, dump cookies, take an element screenshot, or run multi-step interactions where a headless browser would fail CAPTCHAs, get blocked by CSP, or lose the user's session. Trigger keywords - "log in to", "scrape behind login", "real browser", "click and extract", "SPA", "Google Maps", "GitHub", "Reddit", "cookies", "session", "screenshot element", "fill form", "multi-step browse".
+name: chrome-bridge-agent
+description: Browser automation that drives the user's real Chrome (with their logins, cookies, and SPA state) from Python. Use when an agent needs to scrape a logged-in page, click through a SPA, fill a form, dump cookies, take an element screenshot, or run multi-step interactions where a headless browser would fail CAPTCHAs, get blocked by CSP, or lose the user's session. Trigger keywords - "log in to", "scrape behind login", "real browser", "click and extract", "SPA", "Google Maps", "GitHub", "Reddit", "cookies", "session", "screenshot element", "fill form", "multi-step browse", "xiaohongshu", "instagram", "twitter".
 license: MIT
 compatibility: Requires Python 3.10+, the `websockets` package, and Google Chrome (or any Chromium with extension support) on the same machine as the agent.
 metadata:
   version: "1.0.3"
-  homepage: https://github.com/your-org/chrome-bridge
+  homepage: https://github.com/shuyuanshi/chrome-bridge-agent
 ---
 
 # Chrome Bridge
