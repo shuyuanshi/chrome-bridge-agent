@@ -48,7 +48,9 @@ class BridgePage:
                 ws.send(json.dumps(msg, ensure_ascii=False))
                 raw = ws.recv(timeout=90)
         except OSError as e:
-            raise BridgeError(f"could not connect to bridge server at {self._bridge_url}: {e}") from e
+            raise BridgeError(
+                f"could not connect to bridge server at {self._bridge_url}: {e}"
+            ) from e
 
         resp = json.loads(raw)
         if "error" in resp and resp["error"]:

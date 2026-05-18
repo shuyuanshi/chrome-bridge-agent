@@ -16,6 +16,10 @@ let ws = null;
 // Keep-alive browse tabs — managed by browse_open / browse_do / browse_close
 const _managedTabs = new Map();
 
+// Persistent background tab used by navigate / evaluate.
+// Set on first use; never matches the user's active tab so we don't steal focus.
+let _managedTabId = null;
+
 // ───────────────────────── CSP 绕过 ─────────────────────────
 // 移除所有页面的 CSP 头，允许 eval() 和内联脚本。
 // 放在 top-level：SW 每次激活都执行（包括热重载），不依赖 onInstalled。
@@ -290,7 +294,7 @@ async function cmdBrowseAndEval({ url, expression, wait_selector = null, timeout
 // ──────────────────── Keep-alive browse tab 管理 ────────────────────
 
 async function cmdBrowseOpen({ url, timeout = 60000 }) {
-  const tab = await chrome.tabs.create({ url, active: true });
+  const tab = await chrome.tabs.create({ url, active: false });
   await waitForTabComplete(tab.id, null, timeout);
 
   // Wait for SPA to settle
@@ -696,23 +700,18 @@ function domExecutor(method, params) {
 // ───────────────────────── Tab 管理 ─────────────────────────
 
 async function getOrOpenManagedTab() {
-  // Prefer the active tab, but skip chrome:// and chrome-extension:// pages
-  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (activeTab && activeTab.id && activeTab.url &&
-      !activeTab.url.startsWith("chrome://") &&
-      !activeTab.url.startsWith("chrome-extension://")) {
-    return activeTab;
+  // Reuse our own persistent background tab — never hijack the user's active tab.
+  if (_managedTabId !== null) {
+    try {
+      const existing = await chrome.tabs.get(_managedTabId);
+      if (existing) return existing;
+    } catch (e) {
+      // tab was closed; fall through and create a new one
+    }
   }
 
-  // Fallback: any scriptable tab
-  const tabs = await chrome.tabs.query({});
-  const scriptable = tabs.find(t => t.url &&
-    !t.url.startsWith("chrome://") &&
-    !t.url.startsWith("chrome-extension://"));
-  if (scriptable) return scriptable;
-
-  // Last resort: open a blank tab
-  const tab = await chrome.tabs.create({ url: "about:blank" });
+  const tab = await chrome.tabs.create({ url: "about:blank", active: false });
+  _managedTabId = tab.id;
   await waitForTabComplete(tab.id, null, 30000);
   return tab;
 }

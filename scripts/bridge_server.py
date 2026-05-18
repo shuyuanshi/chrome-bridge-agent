@@ -100,11 +100,19 @@ class BridgeServer:
     async def _handle_cli(self, ws: ServerConnection, msg: dict) -> None:
         # 特殊命令：查询 server/extension 状态，无需转发
         if msg.get("method") == "ping_server":
-            await ws.send(json.dumps({"result": {"extension_connected": self._extension_ws is not None}}))
+            await ws.send(
+                json.dumps({"result": {"extension_connected": self._extension_ws is not None}})
+            )
             return
 
         if not self._extension_ws:
-            await ws.send(json.dumps({"error": "Extension not connected. Make sure the Chrome Bridge extension is installed and enabled."}))
+            await ws.send(
+                json.dumps(
+                    {
+                        "error": "Extension not connected. Make sure the Chrome Bridge extension is installed and enabled."
+                    }
+                )
+            )
             return
 
         msg_id = str(uuid.uuid4())
@@ -140,7 +148,9 @@ class BridgeServer:
         try:
             await self._extension_ws.send(json.dumps(msg))
         except Exception as e:
-            logger.warning("failed to send reload command: %s (extension may have already reloaded)", e)
+            logger.warning(
+                "failed to send reload command: %s (extension may have already reloaded)", e
+            )
 
         # Wait for extension to reconnect
         for _ in range(30):  # up to 15 seconds

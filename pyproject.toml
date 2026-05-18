@@ -33,3 +33,54 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/shuyuanshi/chrome-bridge-agent"
 Issues = "https://github.com/shuyuanshi/chrome-bridge-agent/issues"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.6",
+  "pytest>=8.0",
+  "basedpyright>=1.13",
+]
+
+# ───────────────────────── tooling ─────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle errors
+  "F",    # pyflakes
+  "W",    # pycodestyle warnings
+  "I",    # isort
+  "B",    # flake8-bugbear
+  "UP",   # pyupgrade
+  "SIM",  # flake8-simplify
+]
+ignore = [
+  "E501",  # line length is owned by `ruff format`
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]  # allow `assert False` in tests
+
+[tool.basedpyright]
+include = ["scripts", "tests", "examples"]
+exclude = ["**/__pycache__", ".venv"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+reportMissingImports = "error"
+reportUnusedImport = "warning"
+# scripts/* import each other by sys.path, not as a package
+extraPaths = ["scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts"]
+markers = [
+  "integration: tests that require a live Chrome Bridge (server + extension + signed-in browser)",
+]
+addopts = [
+  "-ra",
+  "--strict-markers",
+]

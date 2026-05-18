@@ -42,11 +42,7 @@ def main() -> None:
     #    you want to talk to xiaohongshu's API without using the bridge for
     #    every call.
     cookies = page.get_cookies(domain="xiaohongshu.com")
-    session_names = [
-        c["name"]
-        for c in cookies
-        if c["name"] in ("web_session", "a1", "webId")
-    ]
+    session_names = [c["name"] for c in cookies if c["name"] in ("web_session", "a1", "webId")]
     print(f"cookies for xiaohongshu.com: {len(cookies)}")
     print(f"  session-relevant: {session_names}")
 

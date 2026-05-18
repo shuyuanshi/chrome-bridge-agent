@@ -7,6 +7,28 @@ __pycache__/
 venv/
 .uv-cache/
 
+# uv: lockfile IS committed so CI is reproducible.
+# Only one runtime dep (websockets), so this won't constrain downstream users.
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.basedpyright/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local secrets / cookie jars (see references/cookie-injection-auth.md)
+private/
+*.cookies.json
+
+# Runtime logs
+*.log
+
 # OS
 .DS_Store
 Thumbs.db

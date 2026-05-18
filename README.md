@@ -1,5 +1,9 @@
 # Chrome Bridge Agent
 
+[![CI](https://github.com/shuyuanshi/chrome-bridge-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/shuyuanshi/chrome-bridge-agent/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 > Drive **your real Chrome** — with all your logins, cookies, fingerprints,
 > and extensions — from Python or any AI agent.
 
@@ -103,16 +107,20 @@ extension. The client is one Python class.
 
 ## End-to-end setup
 
-### Step 1 — Clone and install Python dep
+### Step 1 — Clone and install
 
 ```bash
 git clone https://github.com/shuyuanshi/chrome-bridge-agent
 cd chrome-bridge-agent
 
-pip install websockets        # or: uv pip install websockets
+# pick one:
+uv sync                       # recommended — uses the committed uv.lock
+pip install -e .              # standard pip, picks up pyproject.toml
 ```
 
-Requires Python 3.10+ and Google Chrome on the same machine.
+**Requirements:** Python 3.10+ and Google Chrome (or any Chromium with
+extension support) on the same machine. The only runtime dependency is
+`websockets>=12.0`.
 
 ### Step 2 — Load the Chrome extension (one-time)
 
@@ -145,18 +153,21 @@ Requires Python 3.10+ and Google Chrome on the same machine.
 
 ```bash
 python scripts/bridge_server.py
+# or, if you installed with uv:
+uv run python scripts/bridge_server.py
 ```
 
-You should see:
+Output will look roughly like:
 
 ```
-chrome-bridge: Chrome Bridge server listening on ws://localhost:9333
-chrome-bridge: waiting for the Chrome extension to connect...
-chrome-bridge: extension connected
+INFO:chrome-bridge:Chrome Bridge server listening on ws://localhost:9333
+INFO:chrome-bridge:waiting for the Chrome extension to connect...
+INFO:chrome-bridge:extension connected
 ```
 
-Leave this running. The extension auto-reconnects whenever Chrome
-restarts.
+(Exact prefixes depend on your logging config — what matters is the
+"extension connected" line.) Leave this running. The extension
+auto-reconnects whenever Chrome restarts.
 
 ### Step 4 — Smoke-test from Python
 
@@ -191,6 +202,18 @@ installed but Chrome restarted and hasn't reconnected yet — open
 - **Server port already in use.** Default is 9333. Pass `--port 9444` (or
   any free port) and update `BRIDGE_URL` in `bridge_client.py`
   accordingly.
+- **Parallel scripts race on the shared managed tab.** There is exactly
+  one persistent managed tab, so two scripts that both call `navigate()`
+  let the second clobber the first — the earlier script then silently
+  scrapes the wrong page. Either serialise dependent scripts at the
+  scheduler layer, or verify `window.location.hostname` inside the
+  script and re-navigate / `raise` on mismatch.
+- **Bridge no longer steals focus** (since 2026-05-16). The managed tab
+  is opened with `active: false` and reused across calls, so the user's
+  visible window is never hijacked. If you upgraded from an earlier
+  version, reload the extension once at `chrome://extensions` so
+  `background.js` picks up the new behaviour. Details:
+  [`references/background-tab-fix.md`](references/background-tab-fix.md).
 
 ---
 
@@ -329,13 +352,58 @@ when the user asks for browser automation.
 
 ## Deep-dive references
 
+- [`references/anti-bot-sites.md`](references/anti-bot-sites.md) —
+  catalogue of sites that block headless/cloud browsers and require a
+  real, signed-in Chrome.
+- [`references/background-tab-fix.md`](references/background-tab-fix.md)
+  — design notes for the 2026-05-16 "don't steal focus" change and the
+  resulting shared-tab race condition.
+- [`references/cookie-injection-auth.md`](references/cookie-injection-auth.md)
+  — live cookie extraction vs. file injection, `httpOnly` limits, and
+  graceful degradation when auth has expired.
 - [`references/csp-cdp-fallback.md`](references/csp-cdp-fallback.md) — how
   GitHub / Reddit / GitLab work despite their strict CSPs (header
   stripping + CDP fallback design notes).
 - [`references/google-maps-saved-places.md`](references/google-maps-saved-places.md)
   — extracting data when the page mixes Canvas and Shadow DOM.
+- [`references/integration-test-pattern.md`](references/integration-test-pattern.md)
+  — `pytest` auto-skip pattern for projects that depend on a live
+  Bridge.
+- [`references/multi-step-spa-pattern.md`](references/multi-step-spa-pattern.md)
+  — `navigate` + `evaluate` + `wait_*` chains for SPAs that need clicks
+  between extractions.
 - [`references/spa-text-extraction.md`](references/spa-text-extraction.md) —
   chunked `innerText` recovery when DOM snapshots truncate.
+
+---
+
+## Development
+
+Install dev tooling (ruff, pytest, basedpyright) and run the same checks
+CI runs:
+
+```bash
+uv sync --group dev
+
+uv run ruff check .              # lint
+uv run ruff format --check .     # formatting
+uv run basedpyright              # types
+uv run pytest -m "not integration"   # unit + smoke tests (no browser needed)
+```
+
+To run the **integration tests** (requires the bridge server + extension
++ a live Chrome), drop the marker filter:
+
+```bash
+uv run pytest
+```
+
+Integration tests auto-skip when the bridge isn't reachable — see
+[`references/integration-test-pattern.md`](references/integration-test-pattern.md).
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint +
+unit tests on Python 3.10, 3.11, 3.12, and 3.13. It does **not** run the
+integration tests (no headed Chrome in GitHub runners).
 
 ---
 
