@@ -32,46 +32,38 @@ def main() -> None:
             "in chrome://extensions (Site access → 'On all sites')."
         )
 
-    tab = page.browse_open(
-        "https://www.xiaohongshu.com/explore",
-        timeout=45000,
-    )
+    # The session closes itself, even if something below raises.
+    with page.tab("https://www.xiaohongshu.com/explore", timeout=45) as tab:
+        # 1. Pull all session cookies for xiaohongshu. These are the cookies
+        #    your real browser uses — feed them straight into requests/httpx if
+        #    you want to talk to xiaohongshu's API without using the bridge for
+        #    every call.
+        cookies = page.get_cookies(domain="xiaohongshu.com")
+        session_names = [c["name"] for c in cookies if c["name"] in ("web_session", "a1", "webId")]
+        print(f"cookies for xiaohongshu.com: {len(cookies)}")
+        print(f"  session-relevant: {session_names}")
 
-    # 1. Pull all session cookies for xiaohongshu. These are the cookies
-    #    your real browser uses — feed them straight into requests/httpx if
-    #    you want to talk to xiaohongshu's API without using the bridge for
-    #    every call.
-    cookies = page.get_cookies(domain="xiaohongshu.com")
-    session_names = [c["name"] for c in cookies if c["name"] in ("web_session", "a1", "webId")]
-    print(f"cookies for xiaohongshu.com: {len(cookies)}")
-    print(f"  session-relevant: {session_names}")
+        # 2. Read enough innerText to figure out whether we're logged in.
+        text = tab.read_text()[:4000]
+        logged_in = "登录" not in text[:500]
+        print(f"  logged in: {logged_in}")
 
-    # 2. Read enough innerText to figure out whether we're logged in.
-    text = page.browse_do(
-        tab["tab_id"],
-        "document.body.innerText.slice(0, 4000)",
-    )
-    logged_in = "登录" not in text[:500]
-    print(f"  logged in: {logged_in}")
-
-    # 3. Each card in the rendered text looks like:
-    #        <note title>
-    #        <author>
-    #        <like count, e.g. "1.2万">
-    #    The regex below matches lines whose next line is a number — i.e.
-    #    creator handles.
-    authors = [
-        m.group(1).strip()
-        for m in re.finditer(
-            r"\n([^\n]{2,40})\n[\d.]+\s*(?:万|千)?\s*\n",
-            text,
-        )
-    ][:5]
-    print(f"first feed creators ({len(authors)}):")
-    for a in authors:
-        print(f"  - {a}")
-
-    page.browse_close(tab["tab_id"])
+        # 3. Each card in the rendered text looks like:
+        #        <note title>
+        #        <author>
+        #        <like count, e.g. "1.2万">
+        #    The regex below matches lines whose next line is a number — i.e.
+        #    creator handles.
+        authors = [
+            m.group(1).strip()
+            for m in re.finditer(
+                r"\n([^\n]{2,40})\n[\d.]+\s*(?:万|千)?\s*\n",
+                text,
+            )
+        ][:5]
+        print(f"first feed creators ({len(authors)}):")
+        for a in authors:
+            print(f"  - {a}")
 
 
 if __name__ == "__main__":

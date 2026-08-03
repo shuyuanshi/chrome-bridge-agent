@@ -16,55 +16,77 @@ strict CSP.
 
 ## Solution (two layers)
 
-### Layer 1 — Strip the CSP response header
+### Layer 1 — Strip the CSP response header, **for bridge-owned tabs only**
 
-`chrome.declarativeNetRequest.updateDynamicRules` can drop the CSP header
-before the page parses it:
+`chrome.declarativeNetRequest` can drop the CSP header before the page parses
+it. The scope of that rule is the whole design decision.
+
+#### ⚠️ What not to do (this shipped in ≤1.0.3 and was a real vulnerability)
 
 ```javascript
+// ❌ Strips CSP from EVERY site, for as long as the extension is enabled
 chrome.declarativeNetRequest.updateDynamicRules({
   removeRuleIds: [9999],
-  addRules: [{
-    id: 9999, priority: 1,
-    action: {
-      type: "modifyHeaders",
-      responseHeaders: [
-        { header: "content-security-policy", operation: "remove" },
-        { header: "content-security-policy-report-only", operation: "remove" },
-      ],
-    },
-    condition: { urlFilter: "*", resourceTypes: ["main_frame", "sub_frame"] },
-  }],
+  addRules: [{ id: 9999, priority: 1, action: STRIP_CSP,
+    condition: { urlFilter: "*", resourceTypes: ["main_frame", "sub_frame"] } }],
 });
 ```
 
-With no CSP header on the response, `eval()` runs freely in the page.
+Two multipliers make this worse than it looks. *Dynamic* rules persist across
+browser restarts and extension updates, so the user's banking and webmail tabs
+lose CSP 24/7 whether or not the bridge is even running. And removing the CSP
+header also removes `frame-ancestors`, so sites that rely on it instead of
+`X-Frame-Options` become framable. An XSS anywhere in the profile — normally
+contained — becomes fully exploitable.
+
+#### ✅ What 1.1.0 does
+
+`RuleCondition.tabIds` narrows the strip to specific tabs, but it is supported
+**only on session-scoped rules**, so the fix is a change of rule store, not just
+an added field:
+
+```javascript
+async function syncCspRule() {
+  const tabIds = [..._bridgeTabs];               // tabs the bridge itself opened
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [CSP_RULE_ID],
+    addRules: tabIds.length ? [{
+      id: CSP_RULE_ID, priority: 1, action: STRIP_CSP,
+      condition: { urlFilter: "*", resourceTypes: ["main_frame", "sub_frame"], tabIds },
+    }] : [],
+  });
+}
+```
+
+Three consequences worth knowing:
+
+- **Order matters.** A tab is created at `about:blank`, registered, the rule
+  synced, and only *then* navigated — otherwise the real response arrives
+  before the rule exists.
+- **Upgrades must purge the old rule.** Session rules don't replace the
+  persisted dynamic one, so the extension issues a one-time
+  `updateDynamicRules({removeRuleIds: [CSP_RULE_ID]})` at startup.
+- **Tabs the bridge did not open are out of scope** (e.g. one you attached to
+  via `list_tabs`). Those fall through to Layer 2 instead — including the
+  *silent* CSP failure, where `executeScript` returns nothing rather than
+  throwing.
 
 ### ⚠️ Gotcha: `onInstalled` vs top-level
 
-**Don't** put the rule inside `chrome.runtime.onInstalled`:
+**Don't** register the rule inside `chrome.runtime.onInstalled`:
 
 ```javascript
 // ❌ Doesn't fire on hot-reload!
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.declarativeNetRequest.updateDynamicRules({...});
-});
+chrome.runtime.onInstalled.addListener(() => { /* ... */ });
 ```
 
 `bridge_server` reloads the extension via `chrome.runtime.reload()`, which
 does **not** fire `onInstalled`. That event only fires on install, browser
 update, or a manual "Load unpacked".
 
-**Do** put it at the service worker's top level — every SW activation
-(including hot-reload) re-applies the rule:
-
-```javascript
-// ✅ Runs on every SW activation, including hot-reload
-chrome.declarativeNetRequest.updateDynamicRules({...});
-```
-
-`updateDynamicRules` is idempotent — repeated calls don't stack duplicate
-rules.
+**Do** re-apply at the service worker's top level — every SW activation
+(including hot-reload) restores the rule. Session rules are dropped when the
+browser closes, which is exactly the lifetime you want here.
 
 ### Layer 2 — CDP `Runtime.evaluate` fallback
 

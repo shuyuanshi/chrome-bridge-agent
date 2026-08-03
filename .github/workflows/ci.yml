@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Nothing here needs write access; a job that installs unpinned third-party
+# code (see validate-skill) must not hold a writable token.
+permissions:
+  contents: read
+
 # Cancel in-progress runs on the same branch when a newer commit lands.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -38,6 +43,9 @@ jobs:
       - name: basedpyright
         run: uv run basedpyright
 
+      - name: build (the wheel must import as flat modules)
+        run: uv build
+
   test:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -65,6 +73,9 @@ jobs:
   validate-skill:
     name: skills-ref validate (agentskills.io spec)
     runs-on: ubuntu-latest
+    # Installs an unpinned upstream HEAD, so a change there can fail this job
+    # with no local repro. Advisory only — it must not gate a merge.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

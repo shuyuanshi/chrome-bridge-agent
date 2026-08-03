@@ -24,7 +24,16 @@ coverage.xml
 
 # Local secrets / cookie jars (see references/cookie-injection-auth.md)
 private/
-*.cookies.json
+*cookies*.json
+.chrome-bridge-token
+.env
+.env.*
+
+# Captured page content. `chrome-bridge screenshot` writes screenshot.png into
+# the cwd by default, and a screenshot of a logged-in page is every bit as
+# sensitive as a cookie jar.
+*.png
+*.har
 
 # Runtime logs
 *.log

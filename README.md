@@ -91,8 +91,8 @@ anything else, use this.
 ## Architecture
 
 ```
-Python script  ─►  bridge_client.BridgePage
-                       ↕  ws://localhost:9333
+Python script  ─►  bridge_client.BridgePage / Tab
+                       ↕  ws://localhost:9333   (token-authenticated)
                    bridge_server.py  (async WebSocket relay)
                        ↕  WebSocket
                    Chrome Extension  (MV3 background.js)
@@ -101,7 +101,8 @@ Python script  ─►  bridge_client.BridgePage
 ```
 
 The server is one Python process. The Chrome side is one unpacked
-extension. The client is one Python class.
+extension (no content scripts — nothing is injected into pages you browse
+normally). The client is one Python class.
 
 ---
 
@@ -160,7 +161,8 @@ uv run python scripts/bridge_server.py
 Output will look roughly like:
 
 ```
-INFO:chrome-bridge:Chrome Bridge server listening on ws://localhost:9333
+INFO:chrome-bridge:Chrome Bridge server 1.1.0 listening on ws://localhost:9333
+INFO:chrome-bridge:auth enabled; token at /Users/you/.chrome-bridge-token
 INFO:chrome-bridge:waiting for the Chrome extension to connect...
 INFO:chrome-bridge:extension connected
 ```
@@ -169,28 +171,31 @@ INFO:chrome-bridge:extension connected
 "extension connected" line.) Leave this running. The extension
 auto-reconnects whenever Chrome restarts.
 
-### Step 4 — Smoke-test from Python
+The server writes a shared secret to `~/.chrome-bridge-token` (mode 0600) on
+first start; the Python client picks it up automatically. See
+[Security model](#security-model) for why that matters.
 
-```python
-from bridge_client import BridgePage
+### Step 4 — Smoke-test
 
-page = BridgePage()
-assert page.is_server_running()
-assert page.is_extension_connected()
-print(page.browse_and_eval("https://example.com", "document.title"))
-# => "Example Domain"
+```bash
+python3 scripts/bridge_client.py status
+# {"extension_connected": true, "pending": 0, "server_version": "1.1.0"}
+
+python3 scripts/bridge_client.py eval 'document.title' --url https://example.com
+# "Example Domain"
 ```
 
-If `is_extension_connected()` returns `False`, see Step 2 (the extension is
-installed but Chrome restarted and hasn't reconnected yet — open
-`chrome://extensions` and click the ↻ on the extension card).
+If `extension_connected` is `false`, see Step 2 (the extension is installed
+but Chrome restarted and hasn't reconnected yet — open `chrome://extensions`
+and click the ↻ on the extension card).
 
 ### Common pitfalls
 
 - **Two `Chrome Bridge` extensions installed.** If you previously had this
   as a private skill in another directory, *both* extensions will connect
   to port 9333 and the relay routes commands to whichever connected last.
-  Behaviour becomes non-deterministic. Uninstall any duplicates in
+  Behaviour becomes non-deterministic. The server now logs a loud warning
+  when it sees a second extension — uninstall duplicates in
   `chrome://extensions`.
 - **Chrome profile mismatch.** If you have multiple Chrome profiles
   (`Person 1`, `Person 2`, `Work`), the extension is installed *per
@@ -202,18 +207,19 @@ installed but Chrome restarted and hasn't reconnected yet — open
 - **Server port already in use.** Default is 9333. Pass `--port 9444` (or
   any free port) and update `BRIDGE_URL` in `bridge_client.py`
   accordingly.
-- **Parallel scripts race on the shared managed tab.** There is exactly
-  one persistent managed tab, so two scripts that both call `navigate()`
-  let the second clobber the first — the earlier script then silently
-  scrapes the wrong page. Either serialise dependent scripts at the
-  scheduler layer, or verify `window.location.hostname` inside the
-  script and re-navigate / `raise` on mismatch.
-- **Bridge no longer steals focus** (since 2026-05-16). The managed tab
-  is opened with `active: false` and reused across calls, so the user's
-  visible window is never hijacked. If you upgraded from an earlier
-  version, reload the extension once at `chrome://extensions` so
-  `background.js` picks up the new behaviour. Details:
+- **Parallel scripts race on the shared managed tab.** Verbs called straight
+  on `BridgePage` all target one persistent background tab, so two scripts
+  that both call `navigate()` clobber each other. Use a session instead —
+  `with page.tab(url) as tab:` gives each script its own tab, and every verb
+  on that `Tab` targets it.
+- **Bridge doesn't steal focus** (since 2026-05-16). Tabs are opened with
+  `active: false` and reused across calls, so the user's visible window is
+  not hijacked. Details:
   [`references/background-tab-fix.md`](references/background-tab-fix.md).
+  **The single exception is `cdp_mouse`**: Chrome silently drops CDP
+  press/release aimed at a background tab, so that call raises the tab for a
+  sub-second and then restores whatever the user was on. Pass
+  `activate=False` to forbid it (the click then does nothing).
 
 ---
 
@@ -234,41 +240,42 @@ import re
 from bridge_client import BridgePage
 
 page = BridgePage()
-tab = page.browse_open("https://www.xiaohongshu.com/explore", timeout=45000)
 
-# 1. Pull all session cookies for xiaohongshu. These are the same cookies
-#    your real browser uses — feed them straight into requests/httpx if
-#    you want to talk to xiaohongshu's API without using the bridge for
-#    every call.
-cookies = page.get_cookies(domain="xiaohongshu.com")
-session_names = [c["name"] for c in cookies if c["name"] in ("web_session", "a1", "webId")]
-print(f"cookies for xiaohongshu.com: {len(cookies)}")
-print(f"  session-relevant: {session_names}")
+# The session closes itself, even if something below raises.
+with page.tab("https://www.xiaohongshu.com/explore", timeout=45) as tab:
 
-# 2. Confirm we're logged in by reading something only logged-in users see.
-#    xiaohongshu rewrites its DOM constantly — using innerText is more robust
-#    than CSS selectors.
-text = page.browse_do(tab["tab_id"], "document.body.innerText.slice(0, 4000)")
-logged_in = "登录" not in text[:500]  # the login banner is in the first chunk
-print(f"  logged in: {logged_in}")
+    # 1. Pull all session cookies for xiaohongshu. These are the same cookies
+    #    your real browser uses — feed them straight into requests/httpx if
+    #    you want to talk to xiaohongshu's API without using the bridge for
+    #    every call.
+    cookies = page.get_cookies(domain="xiaohongshu.com")
+    session_names = [c["name"] for c in cookies if c["name"] in ("web_session", "a1", "webId")]
+    print(f"cookies for xiaohongshu.com: {len(cookies)}")
+    print(f"  session-relevant: {session_names}")
 
-# 3. Pull the first few rows from the explore feed. Each card in the
-#    rendered text looks like:
-#        <note title>
-#        <author>
-#        <like count, e.g. "1.2万">
-#    So a quick regex on lines whose next line starts with a number
-#    captures the creator names.
-authors = [m.group(1).strip()
-           for m in re.finditer(r"\n([^\n]{2,40})\n[\d.]+\s*(?:万|千)?\s*\n", text)][:5]
-print(f"first feed creators ({len(authors)}):")
-for a in authors:
-    print(f"  - {a}")
+    # 2. Confirm we're logged in by reading something only logged-in users see.
+    #    xiaohongshu rewrites its DOM constantly — using innerText is more robust
+    #    than CSS selectors.
+    text = tab.read_text()[:4000]
+    logged_in = "登录" not in text[:500]  # the login banner is in the first chunk
+    print(f"  logged in: {logged_in}")
 
-page.browse_close(tab["tab_id"])
+    # 3. Pull the first few rows from the explore feed. Each card in the
+    #    rendered text looks like:
+    #        <note title>
+    #        <author>
+    #        <like count, e.g. "1.2万">
+    #    So a quick regex on lines whose next line starts with a number
+    #    captures the creator names.
+    authors = [m.group(1).strip()
+               for m in re.finditer(r"\n([^\n]{2,40})\n[\d.]+\s*(?:万|千)?\s*\n", text)][:5]
+    print(f"first feed creators ({len(authors)}):")
+    for a in authors:
+        print(f"  - {a}")
 ```
 
-Real output on my machine:
+Output shape (handles replaced with placeholders — a real run prints whoever
+is in *your* feed):
 
 ```bash
 $ python example_xiaohongshu.py
@@ -291,44 +298,82 @@ requests.
 
 ## Python API surface
 
-Full list in `scripts/bridge_client.py`. Highlights:
+Full list in `scripts/bridge_client.py`; the agent-facing contract is
+[`SKILL.md`](SKILL.md).
 
-### One-shot (open → eval → close)
+### Sessions — the default for multi-step work
+
+```python
+from bridge_client import BridgePage
+
+page = BridgePage()
+
+with page.tab("https://app.example/dashboard") as tab:   # closed on exit
+    tab.click_element("#filter")
+    tab.wait_for_element(".row", timeout=20)
+    rows = tab.evaluate("document.querySelectorAll('.row').length")
+```
+
+A `Tab` *is* a `BridgePage` bound to one tab, so every verb targets it —
+no more "did that click land on the shared tab?". `name=` reuses the same tab
+across runs (and, being named, survives the `with` block — close it yourself);
+`page.list_tabs("host.com")` attaches to a tab **you** already have open.
+
+### Agent-native snapshot — stop guessing selectors
+
+```python
+print(tab.snapshot_text())
+# [0] button 'Save'
+# [1] checkbox 'I agree' unchecked
+tab.act(1, "check")
+tab.act(0, "click")
+```
+
+Visible interactive elements only, open shadow roots pierced, stale refs
+raise `StaleRefError` instead of mis-clicking.
+
+### Call an internal API with the browser's session
+
+```python
+data = tab.fetch_json("https://internal.example/api/items?limit=50")
+tab.fetch(url, method="POST", body=payload, csrf_from='meta[name="csrf-token"]')
+```
+
+Runs inside the page's origin, so cookies and same-origin CSRF pass.
+
+### One-shot / legacy
+
 ```python
 page.browse_and_eval(url, expression, timeout=30000)
+page.browse_open(url) / page.browse_do(tab_id, js) / page.browse_close(tab_id)
+page.navigate(url); page.evaluate(js)          # shared managed tab
 ```
 
-### Multi-step (persistent tab)
-```python
-tab = page.browse_open(url, timeout=60000)        # returns {tab_id, url, status}
-page.browse_do(tab["tab_id"], js_expression, wait_selector=None)
-page.browse_close(tab["tab_id"])
+### Everything else
+
+`has_element` `wait_for_element` `get_element_text` `get_element_attribute`
+`get_elements_count` `get_html` `read_text` · `input_text`
+`input_content_editable` `select_option` `hover_element` `remove_element` ·
+`scroll_*` `press_key` `type_text` `cdp_mouse` (trusted native input) ·
+`set_file_input` · `screenshot` `screenshot_element` `get_cookies` ·
+`status` `is_server_running` `is_extension_connected`.
+
+Errors are typed (`ElementNotFoundError`, `TabGoneError`, `JSEvalError`,
+`StaleRefError`, `BridgeTimeoutError`, …), all subclassing `BridgeError`
+with a machine-readable `.code`, so retry logic doesn't have to grep
+message strings.
+
+### CLI
+
+```bash
+chrome-bridge eval 'document.title' --url https://example.com
+chrome-bridge snapshot --session dash
+chrome-bridge fetch https://internal/api/x --json
+chrome-bridge screenshot --selector "#chart" --out chart.png
+chrome-bridge status | list-tabs | list-sessions | reload
 ```
 
-### Operate on the active tab
-```python
-page.navigate(url)
-page.evaluate(js)
-page.click_element(selector)
-page.input_text(selector, text)
-page.input_content_editable(selector, text)
-page.has_element(selector)            # -> bool
-page.wait_for_element(selector, timeout=30.0)
-page.get_element_text(selector)
-page.get_element_attribute(selector, attr)
-page.screenshot_element(selector, padding=0)  # -> PNG bytes
-page.scroll_by(x, y)                  # also scroll_to / scroll_to_bottom / scroll_element_into_view
-page.press_key(key)                   # Enter, ArrowDown, Tab, Backspace, ...
-page.type_text(text, delay_ms=50)
-page.set_file_input(selector, files=[path, ...])  # for <input type="file">
-```
-
-### Cookies & status
-```python
-page.get_cookies(domain="")           # empty domain = all cookies the extension can see
-page.is_server_running()              # -> bool
-page.is_extension_connected()         # -> bool
-```
+(Without installing: `python3 scripts/bridge_client.py ...`.)
 
 ---
 
@@ -353,8 +398,8 @@ when the user asks for browser automation.
 ## Deep-dive references
 
 - [`references/anti-bot-sites.md`](references/anti-bot-sites.md) —
-  catalogue of sites that block headless/cloud browsers and require a
-  real, signed-in Chrome.
+  the kinds of wall that stop headless/cloud browsers, and which ones a
+  real, signed-in Chrome gets through.
 - [`references/background-tab-fix.md`](references/background-tab-fix.md)
   — design notes for the 2026-05-16 "don't steal focus" change and the
   resulting shared-tab race condition.
@@ -391,6 +436,15 @@ uv run basedpyright              # types
 uv run pytest -m "not integration"   # unit + smoke tests (no browser needed)
 ```
 
+The browser-free suite covers more than imports:
+
+| File | What it pins |
+|---|---|
+| `tests/test_server.py` | relay routing, auth, deadlines, and both bridge-killing regressions — driven by a fake extension, no Chrome |
+| `tests/test_client_wire.py` | the exact frames `BridgePage` emits, against a fake relay |
+| `tests/test_extension_js.py` | `node --check` plus static invariants (no content script, CSP scoped to tabs, no `captureVisibleTab`) |
+| `tests/test_smoke.py` | exact public API surface, and that every method is documented in `SKILL.md` |
+
 To run the **integration tests** (requires the bridge server + extension
 + a live Chrome), drop the marker filter:
 
@@ -409,17 +463,44 @@ integration tests (no headed Chrome in GitHub runners).
 
 ## Security model
 
-Chrome Bridge Agent runs the agent's commands in your real browser
-profile. That means:
+Chrome Bridge Agent runs the agent's commands in your real browser profile.
+Anything that can talk to the relay can do anything you can do while logged
+in — including `get_cookies()`, which returns session cookies for every
+domain. **Treat the relay like an open shell on your browser.**
 
-- An agent that can talk to `ws://localhost:9333` can do anything you can
-  do while logged in. **Treat the relay like an open shell on your
-  browser.**
+Loopback is *not* a boundary on its own: `ws://localhost` counts as a
+potentially-trustworthy origin, so an ordinary `https://` page is allowed to
+open a WebSocket to it. Two gates close that:
+
+1. **Token.** The server generates a secret at `~/.chrome-bridge-token`
+   (mode 0600) and refuses CLI connections without it. A web page can't read
+   files. Override the location with `CHROME_BRIDGE_TOKEN_FILE`, or the value
+   with `CHROME_BRIDGE_TOKEN`.
+2. **Origin.** Browsers always send an `Origin` header; the Python client
+   never does. Any connection presenting a non-`chrome-extension://` origin
+   is refused before it can send a command.
+
+Residual risk, stated plainly:
+
+- Another process running as **the same user** can read the token file. (The
+  server refuses to write through a symlink and re-applies `0600` on every
+  start; if the file is already group/world-readable it warns loudly.)
+- Nothing authenticates the **server** to the extension. A process that binds
+  port 9333 before the real relay can pose as it and issue commands —
+  including `get_cookies` — without ever seeing the token.
+
+So: this defends against web pages, not against local software you already
+trust. `--no-auth` drops the token gate; the Origin gate stays on regardless.
+
+Other properties worth knowing:
+
 - The relay binds to `localhost` only — not exposed to the network.
-- There is no auth between the client and the relay. If you don't want
-  that (e.g. you're on a shared machine), change `BRIDGE_URL` to a UNIX
-  domain socket in both `bridge_server.py` and `bridge_client.py`, or
-  run the agent inside a sandbox / different user.
+- **CSP stripping is scoped to bridge-owned tabs** via a session
+  declarativeNetRequest rule. Up to 1.0.3 the extension stripped CSP from
+  every site in the profile, permanently, even when the bridge wasn't
+  running; upgrading purges that old rule automatically.
+- **No content scripts.** Nothing is injected into pages you browse
+  normally; page-side code only runs in tabs a command targets.
 - The CDP fallback shows a "is debugging this browser" banner — Chrome
   security feature, can't be hidden, doesn't indicate a problem.
 
