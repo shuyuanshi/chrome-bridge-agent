@@ -235,7 +235,18 @@ class BridgePage:
                     f"Start it with: python scripts/bridge_server.py"
                 ) from e
 
-            resp = json.loads(raw)
+            try:
+                resp = json.loads(raw)
+                if not isinstance(resp, dict):
+                    raise ValueError("reply was not a JSON object")
+            except (ValueError, UnicodeDecodeError) as e:
+                # Whatever answered on this port is not a bridge server. Say so,
+                # instead of leaking a UnicodeDecodeError from json.loads.
+                raise BridgeConnectionError(
+                    f"{self._bridge_url} answered with something that isn't a bridge reply "
+                    f"({e}). Is another process listening on that port?"
+                ) from e
+
             error = resp.get("error")
             code = error.get("code") if isinstance(error, dict) else None
             if code == "UNAUTHORIZED" and attempt == 0:
@@ -628,12 +639,12 @@ class BridgePage:
         Use when synthetic events are ignored — native context menus, HTML5
         drag-and-drop, and widgets that check ``event.isTrusted``.
 
-        **This is the one verb that touches the foreground.** Chrome drops
-        press/release events aimed at a background tab (only pointer *moves*
-        get through), so the tab is brought to the front for the duration and
-        the previously active tab is restored afterwards. Pass
-        ``activate=False`` to skip that — but on a background tab the click
-        will then do nothing at all.
+        **This is the one verb that touches the foreground.** Chrome does not
+        reliably deliver press/release to a tab that isn't visible — pointer
+        *moves* always arrive, but a click is dropped unless the tab's renderer
+        still has a live surface. So the tab is raised for the duration and the
+        previously active tab is restored afterwards. ``activate=False`` skips
+        that, at the risk of the click silently going nowhere.
         """
         return self._call(
             "cdp_mouse",

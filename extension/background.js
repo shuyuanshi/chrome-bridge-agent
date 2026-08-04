@@ -389,6 +389,20 @@ async function handleCommand(msg) {
     case "cdp_mouse":
       return await cmdCdpMouse(params);
 
+    // ── 等待类命令：轮询必须留在 service worker 里 ──
+    // Chrome 会把后台标签页的 setTimeout 节流到分钟级，页面内的轮询循环会
+    // 慢到不可用。SW 不受这个节流，所以由它来打点、每次 executeScript 探一下。
+    case "wait_for_selector": {
+      const tab = await resolveTab(params);
+      await waitForSelector(tab.id, params.selector, params.timeout || 30000);
+      return true;
+    }
+
+    case "wait_dom_stable": {
+      const tab = await resolveTab(params);
+      return await cmdWaitDomStable(tab, params);
+    }
+
     case "browse_do":
       return await cmdBrowseDo(params);
 
@@ -453,12 +467,52 @@ async function getOrOpenManagedTab() {
 }
 
 /**
+ * 开一个后台标签页。
+ *
+ * `chrome.tabs.create` 不带 windowId 时打到「当前窗口」，而 Chrome 在没有
+ * 窗口的时候（用户关掉了所有窗口，但 "continue running background apps"
+ * 让 service worker 还活着）会直接抛 "No current window" —— 整座桥就废了。
+ * 这种情况下退回到任意一个普通窗口，实在没有就自己开一个不抢焦点的。
+ */
+async function newBackgroundTab() {
+  try {
+    return await chrome.tabs.create({ url: "about:blank", active: false });
+  } catch (e) {
+    if (!/no current window|no window with id/i.test(String(e.message || e))) throw e;
+  }
+
+  const windows = await chrome.windows.getAll({ windowTypes: ["normal"] }).catch(() => []);
+  if (windows.length) {
+    return await chrome.tabs.create({
+      url: "about:blank",
+      active: false,
+      windowId: windows[0].id,
+    });
+  }
+
+  // 一个窗口都没有：自己开一个，不抢焦点。新窗口自带一个标签页，直接用它。
+  const created = await chrome.windows.create({
+    url: "about:blank",
+    focused: false,
+    state: "minimized",
+  });
+  const tabs = created && created.tabs ? created.tabs : await chrome.tabs.query({ windowId: created.id });
+  if (!tabs || !tabs.length) {
+    throw bridgeError(
+      "NO_BROWSER_WINDOW",
+      "Chrome has no window to open a tab in. Open a Chrome window and retry.",
+    );
+  }
+  return tabs[0];
+}
+
+/**
  * 建一个属于 bridge 的后台标签页。
  * 先开 about:blank 并登记进 CSP 白名单，再导航 —— 否则目标页的响应头
  * 已经到了，CSP 规则来不及生效。
  */
 async function createBridgeTab(url) {
-  const tab = await chrome.tabs.create({ url: "about:blank", active: false });
+  const tab = await newBackgroundTab();
   _bridgeTabs.add(tab.id);
   await syncCspRule();
   await persistState();
@@ -529,6 +583,19 @@ async function waitForTabComplete(tabId, { timeout = 60000, changedFrom = null }
       );
     }
     await sleep(150);
+  }
+}
+
+/** Poll the DOM size from the service worker until it stops changing. */
+async function cmdWaitDomStable(tab, { timeout = 10000, interval = 500 }) {
+  const started = Date.now();
+  let last = -1;
+  for (;;) {
+    const size = await runFunc(tab.id, () => (document.body ? document.body.innerHTML.length : 0), []);
+    if (size === last && size > 0) return { stable: true, waited_ms: Date.now() - started };
+    last = size;
+    if (Date.now() - started >= timeout) return { stable: false, waited_ms: Date.now() - started };
+    await sleep(interval);
   }
 }
 
@@ -628,6 +695,9 @@ async function cmdListTabs({ url_contains = "" } = {}) {
     .filter((t) => !url_contains || (t.url || "").includes(url_contains))
     .map((t) => ({
       tab_id: String(t.id),
+      // `active` is per *window*, so a tab is only backgrounded by activating
+      // a sibling in the same window — hence exposing the window id.
+      window_id: String(t.windowId),
       url: t.url,
       title: t.title,
       active: t.active,
@@ -685,13 +755,24 @@ async function cmdBrowseClose({ tab_id }) {
   // down, which measurably takes longer than the caller's deadline. The tab
   // does close; awaiting it just turned a success into a spurious TIMEOUT.
   // onRemoved does the real bookkeeping either way.
-  const confirmed = await Promise.race([
-    chrome.tabs.remove(tab.id).then(
-      () => true,
-      () => false,
-    ),
+  const removal = chrome.tabs.remove(tab.id).then(
+    () => ({ ok: true }),
+    (e) => ({ ok: false, error: String((e && e.message) || e) }),
+  );
+  // Report a refusal instead of swallowing it: Chrome rejects tabs.remove
+  // outright in some states ("Tabs cannot be edited right now"), and claiming
+  // {closed: true} there leaves the caller with a tab it thinks is gone.
+  removal.then((r) => {
+    if (!r.ok) console.warn("[Chrome Bridge] tabs.remove refused:", r.error);
+  });
+  const outcome = await Promise.race([
+    removal,
     new Promise((resolve) => setTimeout(() => resolve(null), 2000)),
   ]);
+  if (outcome && !outcome.ok) {
+    throw bridgeError("TAB_CLOSE_FAILED", `Chrome refused to close the tab: ${outcome.error}`);
+  }
+  const confirmed = outcome ? true : null;
 
   _bridgeTabs.delete(tab.id);
   if (_managedTabId === tab.id) _managedTabId = null;
@@ -739,9 +820,10 @@ async function cmdCdpMouse({
   const tab = await resolveTab(rest);
   const nap = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // Chrome delivers CDP mouseMoved to a background tab but silently drops
-  // mousePressed/mouseReleased — so a click on the bridge's own background tab
-  // does nothing at all. Briefly bring the tab to the front, then put back
+  // Chrome always delivers CDP mouseMoved to a background tab, but
+  // mousePressed/mouseReleased only arrive if that tab's renderer still has a
+  // live surface — a click on a tab that has been backgrounded for a while
+  // silently goes nowhere. Raising the tab makes it deterministic; we put back
   // whatever the user was looking at. `activate: false` opts out.
   let restoreTo = null;
   if (activate && !tab.active) {

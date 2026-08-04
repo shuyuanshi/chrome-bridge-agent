@@ -8,11 +8,50 @@ work for any developer.
 from __future__ import annotations
 
 import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from bridge_client import BridgePage, ElementNotFoundError, StaleRefError, Tab, TabGoneError
 
 EXAMPLE = "https://example.com"
+
+
+@pytest.fixture(scope="module")
+def local_site():
+    """A tiny same-origin HTTP server for the fetch tests.
+
+    They used to hit httpbin.org, which made a red suite mean "someone else's
+    service is slow" as often as "the bridge is broken".
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+            if self.path.startswith("/api"):
+                body = json.dumps({"path": self.path, "ok": True}).encode()
+                ctype = "application/json"
+            else:
+                body = b"<!doctype html><h1>local</h1>"
+                ctype = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass  # keep the test output clean
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.mark.integration
@@ -63,12 +102,29 @@ class TestSessions:
         return BridgePage()
 
     def test_tab_context_manager_closes_the_tab(self, page: BridgePage) -> None:
+        """Assert what the bridge controls, not Chrome's scheduling.
+
+        `browse_close` deliberately doesn't wait for Chrome to reap the tab:
+        measured on a real browser, removal lands anywhere between a few
+        milliseconds and (with an unfocused window and a queue of pending
+        removals) over a minute. Blocking on that turned successful closes into
+        spurious TIMEOUTs, so the contract is "the close is issued and the tab
+        is deregistered", and `confirmed` tells you whether Chrome had already
+        finished.
+        """
+        started = time.monotonic()
         with page.tab(EXAMPLE) as tab:
             tab_id = tab.tab_id
             assert tab.evaluate("document.title") == "Example Domain"
-        # The tab is gone, so anything addressed to it must fail loudly.
+        assert time.monotonic() - started < 60, "closing the session blocked for too long"
+
+        assert all(s["tab_id"] != tab_id for s in page.list_sessions())
+        still_owned = [t for t in page.list_tabs() if t["tab_id"] == tab_id and t["bridge_owned"]]
+        assert not still_owned, "tab is still registered as a live bridge session"
+
+    def test_a_tab_id_that_never_existed_is_reported_as_gone(self, page: BridgePage) -> None:
         with pytest.raises(TabGoneError):
-            BridgePage(tab_id=tab_id).evaluate("1")
+            BridgePage(tab_id="99999999").evaluate("1")
 
     def test_typed_verbs_target_the_session_tab(self, page: BridgePage) -> None:
         """Before tab_id plumbing, these silently hit the shared managed tab."""
@@ -129,16 +185,23 @@ class TestAgentPrimitives:
             with pytest.raises(StaleRefError):
                 tab.act(snap["elements"][0]["ref"], "click", snapshot_id="not-the-current-one")
 
-    def test_fetch_uses_the_page_session(self, page: BridgePage) -> None:
-        with page.tab(EXAMPLE) as tab:
-            res = tab.fetch(EXAMPLE)
+    def test_fetch_uses_the_page_session(self, page: BridgePage, local_site: str) -> None:
+        with page.tab(f"{local_site}/") as tab:
+            res = tab.fetch(f"{local_site}/api/thing")
             assert res["ok"] and res["status"] == 200
-            assert "Example Domain" in res["body"]
+            assert "/api/thing" in res["body"]
 
-    def test_fetch_json_parses(self, page: BridgePage) -> None:
-        with page.tab("https://httpbin.org/get") as tab:
-            data = tab.fetch_json("https://httpbin.org/get")
-            assert data["url"].endswith("/get")
+    def test_fetch_json_parses(self, page: BridgePage, local_site: str) -> None:
+        with page.tab(f"{local_site}/") as tab:
+            assert tab.fetch_json(f"{local_site}/api/items")["path"] == "/api/items"
+
+    def test_fetch_raises_on_a_bad_status(self, page: BridgePage, local_site: str) -> None:
+        from bridge_client import BridgeError  # noqa: PLC0415
+
+        with page.tab(f"{local_site}/") as tab:
+            with pytest.raises(BridgeError) as excinfo:
+                tab.fetch(f"{local_site}/api/x", method="POST")  # handler only serves GET
+            assert excinfo.value.code == "HTTP_ERROR"
 
     def test_read_text_pages_a_page_larger_than_the_chunk(self, page: BridgePage) -> None:
         with page.tab(EXAMPLE) as tab:
@@ -370,27 +433,6 @@ class TestInputScrollAndCdp:
         assert (
             tab.evaluate("window.__log.some(e => e[0] === 'contextmenu' && e[1] === true)") is True
         )
-
-    def test_cdp_mouse_without_activation_cannot_click_a_background_tab(self, tab: Tab) -> None:
-        """Documents *why* cdp_mouse activates the tab: Chrome silently drops
-        press/release aimed at a tab that isn't visible (pointer *moves* still
-        get through). If this ever starts failing, the activation dance —
-        the one thing in the bridge that touches the foreground — can go."""
-        page = BridgePage()
-        mine = [t for t in page.list_tabs() if t["tab_id"] == tab.tab_id]
-        if mine and mine[0]["active"]:
-            # Closing a neighbouring tab can promote ours to active; the
-            # premise of this test then no longer holds.
-            pytest.skip("the bridge tab is currently foreground, so nothing is dropped")
-        cx, cy = self._centre(tab, "#btn")
-        tab.evaluate("(function(){window.__log=[];return 1})()")
-        tab.cdp_mouse("click", x=cx, y=cy, activate=False)
-        log = json.loads(tab.evaluate("JSON.stringify(window.__log)"))
-        kinds = {entry[0] for entry in log}
-        # The pointer move lands (hover state still updates); the press/release
-        # that would turn it into a click does not.
-        assert "click" not in kinds, log
-        assert kinds <= {"mouseover", "mousemove"}, log
 
     def test_activate_tab_reports_and_restores_the_displaced_tab(self, tab: Tab) -> None:
         """`reload_self` is the only public verb with no E2E test: it tears

@@ -39,7 +39,16 @@ class FakeRelay:
     def __enter__(self) -> FakeRelay:
         def handler(ws) -> None:
             for raw in ws:
-                msg = json.loads(raw)
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    # Ephemeral ports get recycled under load; a stray frame
+                    # from someone else's connection must not kill this thread.
+                    continue
+                if not (isinstance(msg, dict) and msg.get("role") == "cli"):
+                    # Not one of ours either — don't let it pollute `frames`
+                    # and break an assertion in a way that looks like a bug.
+                    continue
                 self.frames.append(msg)
                 ws.send(json.dumps(self._responder(msg)))
 
@@ -461,3 +470,32 @@ def test_cli_writes_a_screenshot_file(tmp_path, capsys: pytest.CaptureFixture[st
         assert code == 0
         assert out_file.read_bytes().startswith(b"\x89PNG")
         capsys.readouterr()
+
+
+def test_a_non_bridge_reply_is_reported_as_a_connection_problem() -> None:
+    """If something else is squatting the port, say that — don't leak a
+    UnicodeDecodeError out of json.loads."""
+    import threading
+
+    from websockets.sync.server import serve as sync_serve
+
+    def handler(ws) -> None:
+        for _ in ws:
+            ws.send(b"\xff\xfe not json at all")
+
+    server = sync_serve(handler, "localhost", 0)
+    port = server.socket.getsockname()[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        from bridge_client import BridgeConnectionError
+
+        page = BridgePage(f"ws://localhost:{port}", token="tok")
+        with pytest.raises(BridgeConnectionError) as excinfo:
+            page.evaluate("1")
+        assert "isn't a bridge reply" in str(excinfo.value)
+    finally:
+        server.shutdown()
+        with contextlib.suppress(OSError):
+            server.socket.close()
+        thread.join(timeout=5)

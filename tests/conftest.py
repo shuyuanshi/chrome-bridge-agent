@@ -16,13 +16,17 @@ import pytest
 def _bridge_available() -> bool:
     """Probe the Chrome Bridge once per test session.
 
-    Returns True only if the server is up *and* the extension is connected.
-    Any exception (network, import, timeout) means "not available".
+    Returns True only if the server is up, the extension is connected, *and*
+    Chrome actually has a window to drive. The service worker outlives the last
+    window when "continue running background apps" is on, so a connected
+    extension alone is not enough — without this the whole suite errors out
+    with "No current window" instead of skipping.
     """
     try:
         from bridge_client import BridgePage  # noqa: PLC0415 — lazy import on purpose
 
-        return BridgePage().is_extension_connected()
+        page = BridgePage()
+        return bool(page.is_extension_connected() and page.list_tabs())
     except Exception:
         return False
 

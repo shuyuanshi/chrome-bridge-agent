@@ -216,10 +216,10 @@ and click the ↻ on the extension card).
   `active: false` and reused across calls, so the user's visible window is
   not hijacked. Details:
   [`references/background-tab-fix.md`](references/background-tab-fix.md).
-  **The single exception is `cdp_mouse`**: Chrome silently drops CDP
-  press/release aimed at a background tab, so that call raises the tab for a
-  sub-second and then restores whatever the user was on. Pass
-  `activate=False` to forbid it (the click then does nothing).
+  **The single exception is `cdp_mouse`**: Chrome does not reliably deliver
+  CDP press/release to a tab that isn't visible, so that call raises the tab
+  for a sub-second and then restores whatever the user was on. Pass
+  `activate=False` to forbid it, at the risk of the click going nowhere.
 
 ---
 

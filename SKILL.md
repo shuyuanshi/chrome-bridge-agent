@@ -168,17 +168,23 @@ title = page.browse_and_eval("https://example.com", "document.title", timeout=30
 | Files | `set_file_input` |
 | Capture | `screenshot` `screenshot_element` `get_cookies` |
 | Sessions | `tab` `list_tabs` `list_sessions` `activate_tab` `browse_open` `browse_do` `browse_close` `browse_and_eval` |
+
+`browse_close` returns as soon as the close is *issued* — Chrome reaps the
+tab on its own schedule (usually instant, but a queue of removals or an
+unfocused window can stretch it past a minute). `confirmed` in the reply is
+`True` when Chrome had already finished, `None` when it hadn't yet.
 | Health | `status` `is_server_running` `is_extension_connected` `reload_self` |
 
 `cdp_mouse(action, x, y, x2, y2)` sends **trusted** native input via CDP —
 reach for it when synthetic events are ignored (native context menus, HTML5
 drag-and-drop, widgets that check `event.isTrusted`).
 
-> **This is the one verb that touches the foreground.** Chrome delivers CDP
-> pointer *moves* to a background tab but silently drops press/release, so a
-> click on a background tab lands nowhere. The tab is therefore raised for the
-> duration and the user's tab is restored afterwards — a sub-second flash.
-> `activate=False` opts out, at the cost of the click doing nothing.
+> **This is the one verb that touches the foreground.** Chrome always delivers
+> CDP pointer *moves* to a background tab, but press/release only arrive while
+> that tab's renderer still has a live surface — so a click on a tab that has
+> been in the background for a while silently goes nowhere. The tab is
+> therefore raised for the duration and the user's tab is restored afterwards
+> (a sub-second flash). `activate=False` opts out, at that risk.
 > `activate_tab()` exposes the same move on its own, and returns the tab it
 > displaced so you can put it back.
 

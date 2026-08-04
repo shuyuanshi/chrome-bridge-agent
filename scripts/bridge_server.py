@@ -126,7 +126,10 @@ class BridgeServer:
 
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=HANDSHAKE_TIMEOUT)
-        except TimeoutError:
+        # asyncio.TimeoutError only became an alias of the builtin in 3.11; on
+        # 3.10 it is concurrent.futures.TimeoutError and `except TimeoutError`
+        # misses it entirely, killing the connection instead of answering.
+        except asyncio.TimeoutError:
             logger.warning("handshake timed out after %.0fs", HANDSHAKE_TIMEOUT)
             return
         except websockets.exceptions.WebSocketException as e:
@@ -273,7 +276,7 @@ class BridgeServer:
             result = await asyncio.wait_for(future, timeout=timeout)
             logger.debug("← %s in %.2fs", method, time.monotonic() - started)
             await ws.send(json.dumps(result))
-        except TimeoutError:
+        except asyncio.TimeoutError:  # see the note in handle() — 3.10 differs
             self._pending.pop(msg_id, None)
             logger.warning("%s timed out after %.0fs", method, timeout)
             await ws.send(

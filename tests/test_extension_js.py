@@ -152,6 +152,17 @@ def test_page_errors_carry_machine_readable_codes(source: str) -> None:
         assert code in source, code
 
 
+def test_opening_a_tab_survives_having_no_browser_window(source: str) -> None:
+    """Chrome keeps the service worker alive after the last window closes (the
+    "continue running background apps" setting), and `tabs.create` without a
+    windowId then throws "No current window" — which took the whole bridge
+    down rather than just opening a window."""
+    assert "function newBackgroundTab" in source
+    assert "no current window" in source.lower()
+    assert "chrome.windows.create" in source
+    assert "NO_BROWSER_WINDOW" in source
+
+
 def test_closing_a_tab_does_not_block_on_window_teardown(source: str) -> None:
     """chrome.tabs.remove() settles only after the tab — and its window, if it
     was the last one — has torn down, which can outlast the caller's deadline
@@ -159,6 +170,15 @@ def test_closing_a_tab_does_not_block_on_window_teardown(source: str) -> None:
     block = source.split("async function cmdBrowseClose")[1][:900]
     assert "Promise.race" in block
     assert "chrome.tabs.remove" in block
+
+
+def test_waits_are_driven_from_the_service_worker(source: str) -> None:
+    """Chrome throttles setTimeout in background tabs to minute-scale, so an
+    in-page polling loop makes every wait crawl. The SW isn't throttled."""
+    router = source.split("async function handleCommand")[1].split("async function resolveTab")[0]
+    assert 'case "wait_for_selector"' in router
+    assert 'case "wait_dom_stable"' in router
+    assert "async function cmdWaitDomStable" in source
 
 
 def test_state_survives_service_worker_eviction(source: str) -> None:
