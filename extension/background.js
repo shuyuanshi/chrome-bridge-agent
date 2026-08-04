@@ -28,19 +28,26 @@ let _reconnectTimer = null;
 let _managedTabId = null;          // navigate / evaluate 默认用的后台标签页
 const _sessions = new Map();       // name -> tabId
 const _bridgeTabs = new Set();     // 由 bridge 创建的 tab id（CSP 规则作用域）
+let _persistStateTail = Promise.resolve();
 
-async function persistState() {
-  try {
-    await chrome.storage.session.set({
-      state: {
-        managedTabId: _managedTabId,
-        sessions: [..._sessions.entries()],
-        bridgeTabs: [..._bridgeTabs],
-      },
-    });
-  } catch (e) {
-    console.warn("[Chrome Bridge] state persist failed", e);
-  }
+function persistState() {
+  const write = _persistStateTail.then(async () => {
+    try {
+      // Capture at execution time, not queue time, so a later lifecycle change
+      // cannot be overwritten by an older write that happens to finish last.
+      await chrome.storage.session.set({
+        state: {
+          managedTabId: _managedTabId,
+          sessions: [..._sessions.entries()],
+          bridgeTabs: [..._bridgeTabs],
+        },
+      });
+    } catch (e) {
+      console.warn("[Chrome Bridge] state persist failed", e);
+    }
+  });
+  _persistStateTail = write;
+  return write;
 }
 
 // ───────────────────────── 结构化错误 ─────────────────────────
@@ -75,30 +82,35 @@ const CSP_ACTION = {
     { header: "content-security-policy-report-only", operation: "remove" },
   ],
 };
+let _cspSyncTail = Promise.resolve();
 
-async function syncCspRule() {
-  const tabIds = [..._bridgeTabs];
-  try {
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [CSP_RULE_ID],
-      addRules: tabIds.length
-        ? [
-            {
-              id: CSP_RULE_ID,
-              priority: 1,
-              action: CSP_ACTION,
-              condition: {
-                urlFilter: "*",
-                resourceTypes: ["main_frame", "sub_frame"],
-                tabIds,
+function syncCspRule() {
+  const update = _cspSyncTail.then(async () => {
+    const tabIds = [..._bridgeTabs];
+    try {
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [CSP_RULE_ID],
+        addRules: tabIds.length
+          ? [
+              {
+                id: CSP_RULE_ID,
+                priority: 1,
+                action: CSP_ACTION,
+                condition: {
+                  urlFilter: "*",
+                  resourceTypes: ["main_frame", "sub_frame"],
+                  tabIds,
+                },
               },
-            },
-          ]
-        : [],
-    });
-  } catch (e) {
-    console.warn("[Chrome Bridge] CSP rule sync failed", e);
-  }
+            ]
+          : [],
+      });
+    } catch (e) {
+      console.warn("[Chrome Bridge] CSP rule sync failed", e);
+    }
+  });
+  _cspSyncTail = update;
+  return update;
 }
 
 // 一次性清理：干掉 <=1.0.3 留下的、对所有站点永久生效的持久化规则。
@@ -311,7 +323,7 @@ chrome.alarms.onAlarm.addListener(() => {
 });
 
 // 标签页被用户关掉时清理登记，顺便收窄 CSP 规则
-chrome.tabs.onRemoved.addListener(async (tabId) => {
+async function forgetTab(tabId) {
   // The removal event can be what wakes the service worker, in which case the
   // maps are still empty — without this the cleanup silently does nothing.
   await _hydrated;
@@ -331,7 +343,122 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     await syncCspRule();
     await persistState();
   }
-});
+}
+
+/** Stop routing new work to a tab whose close has been requested. */
+function releaseTabRoutes(tabId) {
+  const released = { managed: false, sessions: [] };
+  if (_managedTabId === tabId) {
+    _managedTabId = null;
+    released.managed = true;
+  }
+  for (const [name, id] of _sessions.entries()) {
+    if (id === tabId) {
+      _sessions.delete(name);
+      released.sessions.push(name);
+    }
+  }
+  return released;
+}
+
+async function restoreSessionRouteAfterLocks(tabId, name) {
+  for (;;) {
+    const pending = _sessionOpenLocks.get(name);
+    if (pending) {
+      await pending;
+      continue;
+    }
+    if (_sessions.has(name)) return;
+    const existing = await chrome.tabs.get(tabId).catch(() => null);
+    if (!existing) return;
+    // tabs.get yielded; a new opener may have claimed the lock meanwhile.
+    if (_sessionOpenLocks.has(name)) continue;
+    if (_sessions.has(name)) return;
+    _sessions.set(name, tabId);
+    await persistState();
+    return;
+  }
+}
+
+async function restoreTabRoutes(tabId, released) {
+  // The refusal handler just confirmed the tab is live. Deferred names recheck
+  // existence after their locks settle; immediate routes can be restored now.
+  let dirty = false;
+  if (released.managed && _managedTabId === null) {
+    _managedTabId = tabId;
+    dirty = true;
+  }
+  for (const name of released.sessions) {
+    if (_sessionOpenLocks.has(name)) {
+      // Do not hold up a confirmed refusal while a replacement is opening.
+      // Re-check after the entire current tail settles; successful replacement
+      // wins, failed replacement leaves the name available for restoration.
+      restoreSessionRouteAfterLocks(tabId, name).catch((e) =>
+        console.warn("[Chrome Bridge] deferred session route restore failed", e),
+      );
+      continue;
+    }
+    if (!_sessions.has(name)) {
+      _sessions.set(name, tabId);
+      dirty = true;
+    }
+  }
+  if (dirty) await persistState();
+}
+
+/**
+ * Close a bridge tab without dropping its CSP/state registration while Chrome
+ * is still tearing it down. onRemoved (or the removal promise) finishes the
+ * cleanup; a refused removal deliberately leaves the live tab tracked.
+ */
+async function discardBridgeTab(tabId) {
+  const existing = await chrome.tabs.get(tabId).catch(() => null);
+  if (!existing) {
+    await forgetTab(tabId);
+    return { ok: true, confirmed: true };
+  }
+
+  let releasedRoutes = { managed: false, sessions: [] };
+  let routesChanged = false;
+  const removal = chrome.tabs.remove(tabId).then(
+    async () => {
+      await forgetTab(tabId);
+      return { ok: true };
+    },
+    async (e) => {
+      const error = String((e && e.message) || e);
+      // The tab can disappear between the preflight get() and remove(). Chrome
+      // reports that as a rejected removal even though the desired state won.
+      const stillExists = await chrome.tabs.get(tabId).catch(() => null);
+      if (!stillExists) {
+        await forgetTab(tabId);
+        return { ok: true };
+      }
+      // This handler remains attached after the race below has returned, so a
+      // delayed refusal is not silently lost.
+      console.warn("[Chrome Bridge] tabs.remove refused:", error);
+      if (routesChanged) await restoreTabRoutes(tabId, releasedRoutes);
+      return { ok: false, error };
+    },
+  );
+  const confirmationTimeout = new Promise((resolve) =>
+    setTimeout(() => resolve(null), 2000),
+  );
+  // Stop routing new work as soon as the close is issued. Waiting for the
+  // confirmation race leaves a window where a concurrent named reopen can
+  // select this doomed tab. _bridgeTabs intentionally remains untouched.
+  releasedRoutes = releaseTabRoutes(tabId);
+  routesChanged = releasedRoutes.managed || releasedRoutes.sessions.length > 0;
+  if (routesChanged) await persistState();
+
+  const outcome = await Promise.race([removal, confirmationTimeout]);
+  if (outcome === null) {
+    return { ok: true, confirmed: null };
+  }
+  return { ...outcome, confirmed: outcome.ok };
+}
+
+chrome.tabs.onRemoved.addListener(forgetTab);
 
 // ───────────────────────── 命令路由 ─────────────────────────
 
@@ -516,10 +643,36 @@ async function createBridgeTab(url) {
   _bridgeTabs.add(tab.id);
   await syncCspRule();
   await persistState();
-  if (url && url !== "about:blank") {
-    await chrome.tabs.update(tab.id, { url });
+  try {
+    if (url && url !== "about:blank") {
+      await chrome.tabs.update(tab.id, { url });
+    }
+  } catch (e) {
+    const discarded = await discardBridgeTab(tab.id);
+    if (!discarded.ok || discarded.confirmed !== true) {
+      throw tabCleanupError(tab.id, e, discarded);
+    }
+    throw e;
   }
   return tab;
+}
+
+function tabCleanupError(tabId, original, discarded) {
+  const originalError =
+    original && original.bridge
+      ? original.bridge
+      : { code: "INTERNAL", message: String((original && original.message) || original) };
+  const cleanupStatus = discarded.ok ? "UNCONFIRMED" : "REFUSED";
+  return bridgeError(
+    "TAB_CLEANUP_FAILED",
+    `browse_open failed and tab ${tabId} cleanup is ${cleanupStatus.toLowerCase()}`,
+    {
+      tab_id: String(tabId),
+      original_error: originalError,
+      cleanup_status: cleanupStatus,
+      cleanup_error: discarded.error || null,
+    },
+  );
 }
 
 // ───────────────────────── 导航 ─────────────────────────
@@ -536,17 +689,47 @@ function sameUrl(a, b) {
  * 只有目标 URL 与当前 URL 不同才要求「URL 变过」；重新加载同一个地址时
  * URL 不会变，那种情况只能等 status，否则就是白等到超时。
  */
+function navigationTimeout(timeout, phase) {
+  return bridgeError(
+    "NAV_TIMEOUT",
+    `navigation did not finish within ${timeout}ms (${phase})`,
+    { phase, timeout },
+  );
+}
+
+function remainingNavigationTime(deadline, timeout, phase) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw navigationTimeout(timeout, phase);
+  return Math.max(1, remaining);
+}
+
+async function navigationDelay(ms, deadline, timeout, phase) {
+  if (ms <= 0) return;
+  const remaining = remainingNavigationTime(deadline, timeout, phase);
+  if (ms > remaining) {
+    await sleep(remaining);
+    throw navigationTimeout(timeout, phase);
+  }
+  await sleep(ms);
+  remainingNavigationTime(deadline, timeout, phase);
+}
+
 async function navigateTab(tab, url, { timeout = 60000, settle_ms = 0 } = {}) {
+  const deadline = Date.now() + timeout;
   const before = tab.url;
+  remainingNavigationTime(deadline, timeout, "starting navigation");
   await chrome.tabs.update(tab.id, { url });
   // 给 Chrome 一点时间把 status 翻成 loading，否则会读到上一页的 complete。
-  await sleep(250);
+  await navigationDelay(250, deadline, timeout, "waiting for navigation to start");
   await waitForTabComplete(tab.id, {
-    timeout,
+    timeout: remainingNavigationTime(deadline, timeout, "loading the page"),
     changedFrom: sameUrl(before, url) ? null : before,
   });
-  if (settle_ms > 0) await sleep(settle_ms);
-  return await chrome.tabs.get(tab.id);
+  remainingNavigationTime(deadline, timeout, "finishing page load");
+  await navigationDelay(settle_ms, deadline, timeout, "settling the page");
+  const updated = await chrome.tabs.get(tab.id);
+  remainingNavigationTime(deadline, timeout, "reading final tab state");
+  return updated;
 }
 
 async function cmdNavigate({ url, timeout = 60000, settle_ms = 0, ...rest }) {
@@ -707,37 +890,189 @@ async function cmdListTabs({ url_contains = "" } = {}) {
 
 // ──────────────────── Keep-alive browse tab 管理 ────────────────────
 
-async function cmdBrowseOpen({ url, timeout = 60000, name = null, settle_ms = 2000, wait_selector = null }) {
+const _sessionOpenLocks = new Map();
+
+async function withSessionOpenLock(name, deadline, timeout, fn) {
+  const previous = _sessionOpenLocks.get(name) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  _sessionOpenLocks.set(name, current);
+
+  let released = false;
+  const releaseCurrent = () => {
+    if (released) return;
+    released = true;
+    release();
+    if (_sessionOpenLocks.get(name) === current) _sessionOpenLocks.delete(name);
+  };
+
+  const remaining = deadline - Date.now();
+  let timer = null;
+  const acquired =
+    remaining > 0 &&
+    (await Promise.race([
+      previous.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), remaining);
+      }),
+    ]));
+  if (acquired && timer !== null) clearTimeout(timer);
+  if (!acquired) {
+    // The caller is done, but this FIFO slot must remain until its predecessor
+    // settles. Otherwise the next waiter can overtake the active operation.
+    previous.then(releaseCurrent, releaseCurrent);
+    throw browseOpenTimeout(timeout, "waiting for named session lock");
+  }
+
+  try {
+    return await fn();
+  } finally {
+    releaseCurrent();
+  }
+}
+
+function browseOpenTimeout(timeout, phase) {
+  return bridgeError(
+    "NAV_TIMEOUT",
+    `browse_open did not finish within ${timeout}ms (${phase})`,
+    { phase, timeout },
+  );
+}
+
+function remainingBrowseOpenTime(deadline, timeout, phase) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw browseOpenTimeout(timeout, phase);
+  return Math.max(1, remaining);
+}
+
+async function settleBrowseOpen(settleMs, deadline, timeout) {
+  if (settleMs <= 0) {
+    remainingBrowseOpenTime(deadline, timeout, "finishing page load");
+    return;
+  }
+  const remaining = remainingBrowseOpenTime(deadline, timeout, "settling the page");
+  if (settleMs > remaining) {
+    await sleep(remaining);
+    throw browseOpenTimeout(timeout, "settling the page");
+  }
+  await sleep(settleMs);
+  if (Date.now() > deadline) throw browseOpenTimeout(timeout, "settling the page");
+}
+
+async function cmdBrowseOpen(params = {}) {
+  const name = params.name ?? null;
+  const timeout = params.timeout ?? 60000;
+  const deadline = Date.now() + timeout;
+  if (name === null) return await cmdBrowseOpenUnlocked(params, deadline);
+  return await withSessionOpenLock(name, deadline, timeout, () =>
+    cmdBrowseOpenUnlocked(params, deadline),
+  );
+}
+
+async function cmdBrowseOpenUnlocked({
+  url,
+  timeout = 60000,
+  name = null,
+  settle_ms = 2000,
+  wait_selector = null,
+}, deadline) {
+  // Navigation, settling, selector waits, stale-tab recovery, and named reuse
+  // all consume one caller-visible budget.
   // 命名 session：同名已有活标签页就复用，不再每跑一次泄漏一个标签页。
   if (name && _sessions.has(name)) {
-    const existing = await chrome.tabs.get(_sessions.get(name)).catch(() => null);
+    const sessionTabId = _sessions.get(name);
+    const existing = await chrome.tabs.get(sessionTabId).catch(() => null);
     if (existing) {
-      // 已经停在目标地址就什么都不做 —— 复用的意义就在于此。
-      const fresh = sameUrl(existing.url, url)
-        ? existing
-        : await navigateTab(existing, url, { timeout, settle_ms });
-      if (wait_selector) await waitForSelector(fresh.id, wait_selector, timeout);
-      return { tab_id: String(fresh.id), url: fresh.url, status: "reused", name };
+      try {
+        // 已经停在目标地址就什么都不做 —— 复用的意义就在于此。
+        const needsNavigation = !sameUrl(existing.url, url);
+        const fresh = needsNavigation
+          ? await navigateTab(existing, url, {
+              timeout: remainingBrowseOpenTime(deadline, timeout, "navigating the page"),
+              settle_ms: 0,
+            })
+          : existing;
+        if (needsNavigation) await settleBrowseOpen(settle_ms, deadline, timeout);
+        if (wait_selector) {
+          await waitForSelector(
+            fresh.id,
+            wait_selector,
+            remainingBrowseOpenTime(deadline, timeout, "waiting for the selector"),
+          );
+        }
+        const updated = await chrome.tabs.get(fresh.id);
+        remainingBrowseOpenTime(deadline, timeout, "finishing browse_open");
+        return { tab_id: String(updated.id), url: updated.url, status: "reused", name };
+      } catch (e) {
+        const stillExists = await chrome.tabs.get(sessionTabId).catch(() => null);
+        const message = String((e && e.message) || e);
+        const vanished =
+          !stillExists &&
+          ((e && e.bridge && e.bridge.code === "TAB_GONE") ||
+            /no tab with id|no current window|no window with id/i.test(message));
+        if (!vanished) throw e;
+      }
     }
-    _sessions.delete(name);
+    await forgetTab(sessionTabId);
   }
 
-  const tab = await createBridgeTab(url);
-  // 标签页是先建成 about:blank 再导航的（为了让 CSP 规则先生效），所以要
-  // 明确等 URL 真的离开 about:blank，不能一看到 complete 就返回。
-  await waitForTabComplete(tab.id, {
-    timeout,
-    changedFrom: url && url !== "about:blank" ? "about:blank" : null,
-  });
-  if (settle_ms > 0) await sleep(settle_ms);
-  if (wait_selector) await waitForSelector(tab.id, wait_selector, timeout);
+  for (let attempt = 0; ; attempt++) {
+    let tab = null;
+    try {
+      remainingBrowseOpenTime(deadline, timeout, "opening a tab");
+      tab = await createBridgeTab(url);
+      // 标签页是先建成 about:blank 再导航的（为了让 CSP 规则先生效），所以要
+      // 明确等 URL 真的离开 about:blank，不能一看到 complete 就返回。
+      await waitForTabComplete(tab.id, {
+        timeout: remainingBrowseOpenTime(deadline, timeout, "loading the page"),
+        changedFrom: url && url !== "about:blank" ? "about:blank" : null,
+      });
+      await settleBrowseOpen(settle_ms, deadline, timeout);
+      if (wait_selector) {
+        await waitForSelector(
+          tab.id,
+          wait_selector,
+          remainingBrowseOpenTime(deadline, timeout, "waiting for the selector"),
+        );
+      }
+      remainingBrowseOpenTime(deadline, timeout, "finishing browse_open");
 
-  if (name) {
-    _sessions.set(name, tab.id);
-    await persistState();
+      if (name) {
+        _sessions.set(name, tab.id);
+        await persistState();
+      }
+      const updated = await chrome.tabs.get(tab.id);
+      remainingBrowseOpenTime(deadline, timeout, "finishing browse_open");
+      return { tab_id: String(tab.id), url: updated.url, status: "ready", name };
+    } catch (e) {
+      const stillExists = tab ? await chrome.tabs.get(tab.id).catch(() => null) : null;
+      const message = String((e && e.message) || e);
+      const vanished = tab
+        ? !stillExists
+        : /no tab with id|no current window|no window with id/i.test(message);
+      const transient =
+        vanished &&
+        ((e && e.bridge && e.bridge.code === "TAB_GONE") ||
+          /no tab with id|no current window|no window with id/i.test(message));
+      if (tab) {
+        const discarded = await discardBridgeTab(tab.id);
+        if (!discarded.ok || discarded.confirmed !== true) {
+          throw tabCleanupError(tab.id, e, discarded);
+        }
+      }
+      if (!transient) throw e;
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw browseOpenTimeout(timeout, "recovering from tab teardown");
+      const backoff = Math.min(1000, 250 * 2 ** Math.min(attempt, 2));
+      await sleep(Math.min(backoff, remaining));
+      if (Date.now() >= deadline) {
+        throw browseOpenTimeout(timeout, "recovering from tab teardown");
+      }
+    }
   }
-  const updated = await chrome.tabs.get(tab.id);
-  return { tab_id: String(tab.id), url: updated.url, status: "ready", name };
 }
 
 async function cmdBrowseDo({ tab_id, expression, wait_selector = null, wait_timeout = 15000 }) {
@@ -750,36 +1085,11 @@ async function cmdBrowseClose({ tab_id }) {
   const tab = await resolveTab({ tab_id }).catch(() => null);
   if (!tab) return { closed: false };
 
-  // Don't block on the removal. chrome.tabs.remove() only settles once the tab
-  // — and, when it was the last one, its entire window — has finished tearing
-  // down, which measurably takes longer than the caller's deadline. The tab
-  // does close; awaiting it just turned a success into a spurious TIMEOUT.
-  // onRemoved does the real bookkeeping either way.
-  const removal = chrome.tabs.remove(tab.id).then(
-    () => ({ ok: true }),
-    (e) => ({ ok: false, error: String((e && e.message) || e) }),
-  );
-  // Report a refusal instead of swallowing it: Chrome rejects tabs.remove
-  // outright in some states ("Tabs cannot be edited right now"), and claiming
-  // {closed: true} there leaves the caller with a tab it thinks is gone.
-  removal.then((r) => {
-    if (!r.ok) console.warn("[Chrome Bridge] tabs.remove refused:", r.error);
-  });
-  const outcome = await Promise.race([
-    removal,
-    new Promise((resolve) => setTimeout(() => resolve(null), 2000)),
-  ]);
-  if (outcome && !outcome.ok) {
-    throw bridgeError("TAB_CLOSE_FAILED", `Chrome refused to close the tab: ${outcome.error}`);
+  const discarded = await discardBridgeTab(tab.id);
+  if (!discarded.ok) {
+    throw bridgeError("TAB_CLOSE_FAILED", `Chrome refused to close the tab: ${discarded.error}`);
   }
-  const confirmed = outcome ? true : null;
-
-  _bridgeTabs.delete(tab.id);
-  if (_managedTabId === tab.id) _managedTabId = null;
-  for (const [name, id] of _sessions.entries()) if (id === tab.id) _sessions.delete(name);
-  await syncCspRule();
-  await persistState();
-  return { closed: true, confirmed };
+  return { closed: true, confirmed: discarded.confirmed };
 }
 
 async function cmdBrowseAndEval({ url, expression, wait_selector = null, timeout = 30000 }) {
