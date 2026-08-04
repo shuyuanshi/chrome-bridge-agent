@@ -22,8 +22,9 @@ signed into.
 ## Why this exists
 
 When you ask an agent to "log in to my Notion, find page X, screenshot it"
-or "pull my last 10 xiaohongshu posts", the agent has three off-the-shelf
-options. **All three are bad for anything behind a login.**
+or "pull my last 10 xiaohongshu posts", the agent commonly reaches for one
+of three browser approaches. Most do not share the local profile that is
+already signed in.
 
 ### Option 1 — Playwright / Puppeteer / Selenium (headless or headed)
 
@@ -42,14 +43,13 @@ The agent launches a *fresh* Chromium process with an empty profile. That means:
 - **Per-project setup.** Every agent project needs its own browser binary
   install, its own driver, its own login flow.
 
-### Option 2 — Agent-built-in `browse_*` tools (Claude, Codex, Goose, …)
+### Option 2 — Hosted or isolated agent browser tools
 
-Modern coding agents ship a built-in browser tool that runs in the cloud
-(Claude Code's `browser_navigate` / `browser_console` / `browser_snapshot`,
-Codex's web tool, etc.). They're great for *public* pages, but:
+Many coding agents offer a browser that runs in a hosted or isolated
+environment. These tools are great for *public* pages, but commonly:
 
-- **Runs on a remote, ephemeral Chromium**, not on your machine. There is
-  no way to give it your session — your cookies live in your local browser.
+- **Run without your local Chrome profile.** Your cookies and extensions stay
+  in the browser on your machine.
 - **DOM snapshots truncate** at a few hundred elements on large SPAs
   (Next.js, virtualised lists). Re-snapshotting doesn't help.
 - **State doesn't persist** between calls reliably. Multi-step
@@ -57,6 +57,10 @@ Codex's web tool, etc.). They're great for *public* pages, but:
 - **Some sites refuse the tool's User-Agent / IP range** outright, especially
   Chinese sites (xiaohongshu, bilibili, zhihu) and anything behind
   Cloudflare's strict mode.
+
+Some hosts also provide a native integration with an existing Chrome profile.
+Prefer that integration when it can reach the required profile; Chrome Bridge
+fills the gap when it cannot.
 
 ### Option 3 — Browser MCP servers (puppeteer-mcp, browserbase, etc.)
 
@@ -125,7 +129,8 @@ extension support) on the same machine. The only runtime dependency is
 
 ### Step 2 — Load the Chrome extension (one-time)
 
-1. Open `chrome://extensions` in the same Chrome you use daily.
+1. Open `chrome://extensions` in the Chrome profile you intend to expose.
+   A dedicated automation profile is safer than your daily browsing profile.
 2. Toggle **Developer mode** (top right).
 3. Click **Load unpacked**, select the `extension/` directory of this
    repo.
@@ -229,8 +234,8 @@ This is the kind of thing every other tool fails at:
 
 - Playwright: gets blocked by xiaohongshu's bot detection within seconds.
 - Headless Chrome: same.
-- Claude's built-in `browser_*`: xiaohongshu's edge blocks it
-  geographically and by IP range.
+- Hosted browser tools: xiaohongshu's edge may block their region or IP
+  range, and they do not carry your local signed-in profile.
 - Chrome Bridge Agent: works trivially, because **you're already logged
   in to xiaohongshu in your real Chrome**.
 
@@ -384,14 +389,14 @@ This repo is also a valid [Agent Skills](https://agentskills.io) package
 `chrome-bridge-agent/` directory into your agent's skills directory, or
 symlink it:
 
-- **Claude Code**: `ln -s $(pwd)/chrome-bridge-agent ~/.claude/skills/`
-- **OpenAI Codex**: see [Codex skills docs](https://developers.openai.com/codex/skills/)
+- **Claude Code**: `mkdir -p ~/.claude/skills && ln -s "$(pwd)" ~/.claude/skills/chrome-bridge-agent`
+- **OpenAI Codex**: see the [Codex setup note](references/codex.md)
 - **opencode**: drop into `.opencode/skills/`
 - **Goose**: see [Goose skills docs](https://block.github.io/goose/docs/guides/context-engineering/using-skills/)
 - **Hermes / other agentskills.io-compatible runtimes**: same — place under their skills root.
 
-The agent will pick up `SKILL.md` automatically and call into the bridge
-when the user asks for browser automation.
+The agent will pick up `SKILL.md` automatically (some hosts do so on the next
+turn) and call into the bridge when the user asks for browser automation.
 
 ---
 

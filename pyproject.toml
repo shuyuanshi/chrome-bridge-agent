@@ -49,7 +49,17 @@ only-include = ["scripts"]
 sources = ["scripts"]
 
 [tool.hatch.build.targets.sdist]
-include = ["scripts", "extension", "tests", "references", "examples", "SKILL.md", "README.md", "LICENSE"]
+include = [
+  "agents",
+  "scripts",
+  "extension",
+  "tests",
+  "references",
+  "examples",
+  "SKILL.md",
+  "README.md",
+  "LICENSE",
+]
 
 [dependency-groups]
 dev = [
