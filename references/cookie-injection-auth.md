@@ -94,8 +94,10 @@ elif "unhuman" in url_check:
 
 **Key insight**: Bridge runs in the user's real Chrome. If the user has
 logged in to the target site at any point, the cookie is already in
-Chrome's cookie store. `page.get_cookies()` reads it live — no file to
-maintain, nothing to refresh.
+Chrome's cookie store. `page.get_cookies(domain="example.com")` reads one
+domain live — no file to maintain, nothing to refresh. A no-argument call
+fails closed; full-profile export requires the explicit, sensitive
+`page.get_cookies(all_domains=True)` opt-in.
 
 ```python
 def _extract_live_cookies(page) -> dict[str, str]:
@@ -142,6 +144,6 @@ the file backup.
 |------|------|
 | **`httpOnly` cookies can't be set via `document.cookie`** | If the site's auth token is `httpOnly`, file-based injection doesn't work — use live extraction (`page.get_cookies`) instead. |
 | **CAPTCHA risk** | Injected cookies can trip anti-bot challenges (e.g. Zhihu's `unhuman` page). |
-| **Cookies expire** | `get_cookies()` reads whatever the browser currently has. If the user hasn't visited the site in Chrome for a long time, the cookie is stale. |
-| **`BridgePage` has no `set_cookies`** | Today the API only has `get_cookies()`. Injection goes through `browse_do` + `document.cookie`. |
+| **Cookies expire** | `get_cookies(domain=...)` reads whatever the browser currently has. If the user hasn't visited the site in Chrome for a long time, the cookie is stale. |
+| **`BridgePage` has no `set_cookies`** | Today the API only has scoped `get_cookies(domain=...)` reads. Injection goes through `browse_do` + `document.cookie`. |
 | **Live still hits `signin` if the server revoked the cookie** | The cookie exists locally but is no longer valid. The post-inject URL check is the final say. |

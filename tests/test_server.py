@@ -168,7 +168,7 @@ def test_extension_version_is_reported() -> None:
     async def scenario() -> dict:
         async with running_server() as (_server, port):
             ws = await connect(f"ws://localhost:{port}")
-            await ws.send(json.dumps({"role": "extension", "version": "1.1.0"}))
+            await ws.send(json.dumps({"role": "extension", "version": "2.0.0"}))
             await asyncio.sleep(0.05)
             try:
                 return await cli_call(port, {"method": "ping_server"})
@@ -176,7 +176,7 @@ def test_extension_version_is_reported() -> None:
                 await ws.close()
 
     reply = run(scenario())
-    assert reply["result"]["extension_version"] == "1.1.0"
+    assert reply["result"]["extension_version"] == "2.0.0"
 
 
 # ─────────────────────── routing & errors ───────────────────────

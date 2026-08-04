@@ -10,6 +10,7 @@ function plain(value) {
 
 async function harness(options = {}) {
   const tabs = new Map();
+  const cookieCalls = [];
   const cspUpdates = [];
   const storageWrites = [];
   const warnings = [];
@@ -34,6 +35,12 @@ async function harness(options = {}) {
     alarms: {
       create() {},
       onAlarm: { addListener() {} },
+    },
+    cookies: {
+      async getAll(params) {
+        cookieCalls.push(params);
+        return [];
+      },
     },
     debugger: {
       async attach() {},
@@ -146,6 +153,7 @@ async function harness(options = {}) {
   return {
     context,
     tabs,
+    cookieCalls,
     cspUpdates,
     storageWrites,
     warnings,
@@ -828,6 +836,29 @@ async function testPendingNamedCloseReopensWithoutReusingDoomedTab() {
   });
 }
 
+async function testCookieScopeIsStrictAndExplicit() {
+  const state = await harness();
+
+  await evaluate(state, 'cmdGetCookies({domain:" example.com "})');
+  await evaluate(state, "cmdGetCookies({all_domains:true})");
+  assert.deepEqual(plain(state.cookieCalls), [{ domain: "example.com" }, {}]);
+
+  await assert.rejects(evaluate(state, "cmdGetCookies({})"), /cookie scope required/);
+  await assert.rejects(
+    evaluate(state, 'cmdGetCookies({domain:"example.com", all_domains:true})'),
+    /mutually exclusive/,
+  );
+  await assert.rejects(
+    evaluate(state, 'cmdGetCookies({all_domains:"true"})'),
+    /cookie scope required/,
+  );
+  await assert.rejects(
+    evaluate(state, 'cmdGetCookies({domain:"", all_domains:true})'),
+    /cookie scope required/,
+  );
+  await assert.rejects(evaluate(state, "cmdGetCookies({domain:42})"), /cookie scope required/);
+}
+
 await testTransientTabTeardownRetriesUntilDeadline();
 await testNonTransientCreationFailureClosesTheTab();
 await testFrameLossOnALiveTabDoesNotRetry();
@@ -849,3 +880,4 @@ await testConcurrentSameNameOpenCreatesOneTab();
 await testTimedOutNamedWaiterPreservesFifoOrder();
 await testNamedReuseSharesTheOpenDeadline();
 await testPendingNamedCloseReopensWithoutReusingDoomedTab();
+await testCookieScopeIsStrictAndExplicit();

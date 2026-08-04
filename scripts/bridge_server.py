@@ -37,7 +37,7 @@ from websockets.asyncio.server import ServerConnection, serve
 
 logger = logging.getLogger("chrome-bridge")
 
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "2.0.0"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WATCH_FILES = [

@@ -127,6 +127,14 @@ pip install -e .              # standard pip, picks up pyproject.toml
 extension support) on the same machine. The only runtime dependency is
 `websockets>=12.0`.
 
+### Upgrading from 1.1
+
+Version 2.0 intentionally breaks the old implicit full-profile cookie export.
+`page.get_cookies()` and `chrome-bridge cookies` now require either one domain
+or an explicit all-domain opt-in. Restart the relay and reload the unpacked
+extension after upgrading. `chrome-bridge status` should show both
+`server_version` and `extension_version` as `2.0.0`.
+
 ### Step 2 — Load the Chrome extension (one-time)
 
 1. Open `chrome://extensions` in the Chrome profile you intend to expose.
@@ -146,8 +154,8 @@ extension support) on the same machine. The only runtime dependency is
    <code>manifest.json</code> declares. Without flipping this to "On all
    sites":
 
-   - `page.get_cookies()` will return only cookies for domains the user
-     has individually granted (often empty).
+   - `page.get_cookies(domain="example.com")` will return only cookies for
+     domains the user has individually granted (often empty).
    - `page.navigate` / `page.evaluate` will still work on the *active*
      tab via `activeTab`, but fail mysteriously on background tabs.
 
@@ -166,7 +174,7 @@ uv run python scripts/bridge_server.py
 Output will look roughly like:
 
 ```
-INFO:chrome-bridge:Chrome Bridge server 1.1.0 listening on ws://localhost:9333
+INFO:chrome-bridge:Chrome Bridge server 2.0.0 listening on ws://localhost:9333
 INFO:chrome-bridge:auth enabled; token at /Users/you/.chrome-bridge-token
 INFO:chrome-bridge:waiting for the Chrome extension to connect...
 INFO:chrome-bridge:extension connected
@@ -184,7 +192,7 @@ first start; the Python client picks it up automatically. See
 
 ```bash
 python3 scripts/bridge_client.py status
-# {"extension_connected": true, "pending": 0, "server_version": "1.1.0"}
+# {"extension_connected": true, "pending": 0, "server_version": "2.0.0"}
 
 python3 scripts/bridge_client.py eval 'document.title' --url https://example.com
 # "Example Domain"
@@ -470,8 +478,14 @@ integration tests (no headed Chrome in GitHub runners).
 
 Chrome Bridge Agent runs the agent's commands in your real browser profile.
 Anything that can talk to the relay can do anything you can do while logged
-in — including `get_cookies()`, which returns session cookies for every
-domain. **Treat the relay like an open shell on your browser.**
+in — including an explicit `get_cookies(all_domains=True)` request, which
+returns session cookies for every domain. **Treat the relay like an open shell
+on your browser.** Ordinary cookie reads require a domain; no-argument calls
+fail closed. The CLI equivalent for a full-profile export is the deliberately
+named `cookies --all-domains` flag.
+Cookie CLI output redacts values unless `--show-values` is passed. Avoid that
+flag in agent-visible terminals; use the Python API in-process when a workflow
+needs a value and do not log it.
 
 Loopback is *not* a boundary on its own: `ws://localhost` counts as a
 potentially-trustworthy origin, so an ordinary `https://` page is allowed to

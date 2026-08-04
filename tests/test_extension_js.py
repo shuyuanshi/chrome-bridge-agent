@@ -120,6 +120,18 @@ def test_snapshot_masks_secret_field_values(source: str) -> None:
     assert "one-time-code" in snapshot
 
 
+def test_cookie_export_requires_an_explicit_scope(source: str) -> None:
+    block = source.split("async function cmdGetCookies")[1].split("async function cmdActivateTab")[
+        0
+    ]
+    assert 'typeof domain === "string"' in block
+    assert "domain.trim()" in block
+    assert "all_domains === true" in block
+    assert "domain and all_domains are mutually exclusive" in block
+    assert "cookie scope required" in block
+    assert block.count("chrome.cookies.getAll({})") == 1
+
+
 def test_snapshot_only_reports_checked_for_checkable_roles(source: str) -> None:
     """el.checked is a boolean on every input, so an ungated copy labels text
     boxes 'unchecked' and invites the model to click them."""

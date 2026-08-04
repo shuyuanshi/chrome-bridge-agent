@@ -841,8 +841,17 @@ async function cmdScreenshot({ selector = null, padding = 0, full_page = false, 
 
 // ───────────────────────── Cookies ─────────────────────────
 
-async function cmdGetCookies({ domain = "" } = {}) {
-  return domain ? await chrome.cookies.getAll({ domain }) : await chrome.cookies.getAll({});
+async function cmdGetCookies({ domain = null, all_domains = false } = {}) {
+  const hasDomain = typeof domain === "string" && domain.trim() !== "";
+  if (hasDomain && all_domains === true) {
+    throw bridgeError("BAD_REQUEST", "domain and all_domains are mutually exclusive");
+  }
+  if (hasDomain) return await chrome.cookies.getAll({ domain: domain.trim() });
+  if (all_domains === true && domain === null) return await chrome.cookies.getAll({});
+  throw bridgeError(
+    "BAD_REQUEST",
+    "cookie scope required: pass a non-empty domain or all_domains=true",
+  );
 }
 
 /**

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -105,6 +106,89 @@ def test_screenshot_element_sends_selector_and_padding() -> None:
         page_for(relay).screenshot_element("#chart", padding=7)
         assert relay.last("method") == "screenshot_element"
         assert relay.last_params() == {"selector": "#chart", "padding": 7}
+
+
+@pytest.mark.parametrize("domain", ["", "   "])
+def test_cookie_export_requires_an_explicit_scope(domain: str) -> None:
+    with FakeRelay() as relay:
+        with pytest.raises(ValueError, match="cookie scope required"):
+            page_for(relay).get_cookies(domain)
+        assert relay.frames == []
+
+
+def test_cookie_export_sends_only_the_requested_domain() -> None:
+    with FakeRelay(lambda _m: {"result": []}) as relay:
+        page_for(relay).get_cookies(" example.com ")
+        assert relay.last("method") == "get_cookies"
+        assert relay.last_params() == {"domain": "example.com"}
+
+
+def test_all_domain_cookie_export_requires_an_explicit_opt_in() -> None:
+    with FakeRelay(lambda _m: {"result": []}) as relay:
+        page_for(relay).get_cookies(all_domains=True)
+        assert relay.last("method") == "get_cookies"
+        assert relay.last_params() == {"all_domains": True}
+
+
+def test_cookie_export_rejects_conflicting_or_invalid_scope() -> None:
+    with FakeRelay() as relay:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            page_for(relay).get_cookies("example.com", all_domains=True)
+        with pytest.raises(TypeError, match="domain must be a string"):
+            page_for(relay).get_cookies(None)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="all_domains must be a bool"):
+            page_for(relay).get_cookies(all_domains="yes")  # type: ignore[arg-type]
+        assert relay.frames == []
+
+
+def test_debug_logging_does_not_emit_cookie_values_or_bridge_tokens(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import bridge_client
+
+    root_logger = logging.getLogger()
+    websocket_logger = logging.getLogger("websockets")
+    websocket_client_logger = logging.getLogger("websockets.client")
+    bridge_logger = bridge_client._LOG
+    saved = {
+        "root_level": root_logger.level,
+        "websocket_level": websocket_logger.level,
+        "websocket_client_level": websocket_client_logger.level,
+        "bridge_level": bridge_logger.level,
+        "bridge_handlers": list(bridge_logger.handlers),
+        "bridge_propagate": bridge_logger.propagate,
+    }
+
+    try:
+        root_logger.setLevel(logging.DEBUG)
+        websocket_logger.setLevel(logging.NOTSET)
+        websocket_client_logger.setLevel(logging.DEBUG)
+        bridge_logger.handlers.clear()
+        bridge_logger.propagate = True
+        bridge_client._configure_debug_logging()
+
+        with FakeRelay(
+            lambda _msg: {"result": [{"name": "sid", "value": "TOPSECRET_COOKIE"}]}
+        ) as relay:
+            BridgePage(relay.url, token="TOPSECRET_TOKEN").get_cookies("example.com")
+
+        stderr = capsys.readouterr().err
+        assert "get_cookies" in stderr
+        assert "<redacted>" in stderr
+        assert "TOPSECRET_COOKIE" not in stderr
+        assert "TOPSECRET_TOKEN" not in stderr
+        assert websocket_logger.getEffectiveLevel() >= logging.WARNING
+        assert websocket_client_logger.getEffectiveLevel() >= logging.WARNING
+    finally:
+        for handler in bridge_logger.handlers:
+            if handler not in saved["bridge_handlers"]:
+                handler.close()
+        bridge_logger.handlers[:] = saved["bridge_handlers"]
+        bridge_logger.setLevel(saved["bridge_level"])
+        bridge_logger.propagate = saved["bridge_propagate"]
+        websocket_client_logger.setLevel(saved["websocket_client_level"])
+        websocket_logger.setLevel(saved["websocket_level"])
+        root_logger.setLevel(saved["root_level"])
 
 
 def test_long_waits_get_a_deadline_above_the_wait() -> None:
@@ -434,6 +518,8 @@ def test_cli_routes_each_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
             return {"result": {"extension_connected": True}}
         if method == "list_tabs":
             return {"result": [{"tab_id": "3", "url": "u"}]}
+        if method == "get_cookies":
+            return {"result": [{"name": "sid", "value": "secret", "domain": "example.com"}]}
         return {"result": "42"}
 
     with FakeRelay(responder) as relay:
@@ -450,10 +536,63 @@ def test_cli_routes_each_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
         assert main([*base, "fetch", "https://x/api", "--json"]) == 0
         capsys.readouterr()
 
+        assert main([*base, "cookies", "--domain", "example.com"]) == 0
+        domain_output = capsys.readouterr().out
+        assert "<redacted>" in domain_output
+        assert "secret" not in domain_output
+
+        assert main([*base, "cookies", "--all-domains"]) == 0
+        all_output = capsys.readouterr().out
+        assert "<redacted>" in all_output
+        assert "secret" not in all_output
+
         methods = [f["method"] for f in relay.frames]
         # --url must open and dispose of a temp tab around the command
         assert methods.count("browse_open") == 1
         assert methods.count("browse_close") == 1
+        cookie_frames = [frame for frame in relay.frames if frame["method"] == "get_cookies"]
+        assert [frame["params"] for frame in cookie_frames] == [
+            {"domain": "example.com"},
+            {"all_domains": True},
+        ]
+
+
+def test_cli_cookie_export_requires_exactly_one_scope() -> None:
+    from bridge_client import main
+
+    with pytest.raises(SystemExit) as missing:
+        main(["cookies"])
+    assert missing.value.code == 2
+
+    with pytest.raises(SystemExit) as conflicting:
+        main(["cookies", "--domain", "example.com", "--all-domains"])
+    assert conflicting.value.code == 2
+
+    with pytest.raises(SystemExit) as empty:
+        main(["cookies", "--domain", "   "])
+    assert empty.value.code == 2
+
+
+def test_cli_cookie_values_require_an_explicit_reveal_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from bridge_client import main
+
+    def responder(msg: dict) -> dict:
+        assert msg["params"] == {"domain": "example.com"}
+        return {"result": [{"name": "sid", "value": "secret"}]}
+
+    with FakeRelay(responder) as relay:
+        base = ["--bridge-url", relay.url, "cookies", "--domain", "example.com"]
+        assert main(base) == 0
+        redacted = capsys.readouterr().out
+        assert "<redacted>" in redacted
+        assert "secret" not in redacted
+
+        assert main([*base, "--show-values"]) == 0
+        revealed = capsys.readouterr().out
+        assert "secret" in revealed
+        assert "<redacted>" not in revealed
 
 
 def test_cli_writes_a_screenshot_file(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
