@@ -1,6 +1,6 @@
 # Sites That Require Chrome Bridge
 
-When a cloud-hosted or headless browser (Claude Code's `browser_navigate`,
+When a cloud-hosted or headless browser (a host browser tool,
 Playwright/Selenium, Browserbase, Puppeteer MCP, …) gets blocked, fall
 back to **Chrome Bridge** — it runs inside the user's real Chrome with
 real cookies and a real residential fingerprint.

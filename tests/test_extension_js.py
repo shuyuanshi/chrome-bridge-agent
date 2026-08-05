@@ -18,6 +18,7 @@ import pytest
 EXT = Path(__file__).resolve().parent.parent / "extension"
 BACKGROUND = EXT / "background.js"
 MANIFEST = EXT / "manifest.json"
+RUNTIME_TEST = Path(__file__).resolve().parent / "js" / "test_background_runtime.mjs"
 
 
 def _strip_comments(js: str) -> str:
@@ -44,6 +45,11 @@ def manifest() -> dict:
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_background_js_parses() -> None:
     subprocess.run(["node", "--check", str(BACKGROUND)], check=True, capture_output=True)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_background_runtime_behaviour() -> None:
+    subprocess.run(["node", str(RUNTIME_TEST)], check=True, capture_output=True)
 
 
 def test_manifest_is_valid_and_declares_what_the_code_uses(manifest: dict) -> None:
@@ -114,6 +120,18 @@ def test_snapshot_masks_secret_field_values(source: str) -> None:
     assert "one-time-code" in snapshot
 
 
+def test_cookie_export_requires_an_explicit_scope(source: str) -> None:
+    block = source.split("async function cmdGetCookies")[1].split("async function cmdActivateTab")[
+        0
+    ]
+    assert 'typeof domain === "string"' in block
+    assert "domain.trim()" in block
+    assert "all_domains === true" in block
+    assert "domain and all_domains are mutually exclusive" in block
+    assert "cookie scope required" in block
+    assert block.count("chrome.cookies.getAll({})") == 1
+
+
 def test_snapshot_only_reports_checked_for_checkable_roles(source: str) -> None:
     """el.checked is a boolean on every input, so an ungated copy labels text
     boxes 'unchecked' and invites the model to click them."""
@@ -167,9 +185,13 @@ def test_closing_a_tab_does_not_block_on_window_teardown(source: str) -> None:
     """chrome.tabs.remove() settles only after the tab — and its window, if it
     was the last one — has torn down, which can outlast the caller's deadline
     and turn a successful close into a spurious TIMEOUT."""
-    block = source.split("async function cmdBrowseClose")[1][:900]
-    assert "Promise.race" in block
-    assert "chrome.tabs.remove" in block
+    discard = source.split("async function discardBridgeTab")[1].split(
+        "chrome.tabs.onRemoved.addListener"
+    )[0]
+    close = source.split("async function cmdBrowseClose")[1][:600]
+    assert "Promise.race" in discard
+    assert "chrome.tabs.remove" in discard
+    assert "discardBridgeTab" in close
 
 
 def test_waits_are_driven_from_the_service_worker(source: str) -> None:

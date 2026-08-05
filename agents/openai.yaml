@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chrome Bridge Agent"
+  short_description: "Drive your signed-in Chrome from Codex"
+  default_prompt: "Use $chrome-bridge-agent to safely inspect and interact with my existing Chrome session."

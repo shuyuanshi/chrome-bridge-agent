@@ -21,9 +21,9 @@ Three ways to use it:
     page.navigate("https://example.com")
     page.evaluate("document.title")
 
-Set CHROME_BRIDGE_DEBUG=1 to log every RPC (method, params, elapsed, reply) to
-stderr. Cookie replies are redacted, but *parameters* are logged verbatim — so
-don't leave it on for a run that types a credential.
+Set CHROME_BRIDGE_DEBUG=1 to log every RPC (method, params, elapsed, reply) from
+the bridge logger to stderr. Cookie replies are redacted, but *parameters* are
+logged verbatim — so don't leave it on for a run that types a credential.
 """
 
 from __future__ import annotations
@@ -232,7 +232,8 @@ class BridgePage:
             except (OSError, WebSocketException) as e:
                 raise BridgeConnectionError(
                     f"could not talk to the bridge server at {self._bridge_url}: {e}. "
-                    f"Start it with: python scripts/bridge_server.py"
+                    "Start it with `chrome-bridge-server`, or from a source checkout with "
+                    "`python3 scripts/bridge_server.py`."
                 ) from e
 
             try:
@@ -674,14 +675,25 @@ class BridgePage:
 
     # ─── Cookies ────────────────────────────────────────────────
 
-    def get_cookies(self, domain: str = "") -> list[dict]:
-        """Return cookies for the given domain (or all domains if empty).
+    def get_cookies(self, domain: str = "", *, all_domains: bool = False) -> list[dict]:
+        """Return cookies for one domain, or every domain by explicit opt-in.
 
         Each entry: {name, value, domain, path, secure, httpOnly, ...}.
         """
-        params: dict[str, Any] = {}
+        if not isinstance(domain, str):
+            raise TypeError("domain must be a string")
+        if not isinstance(all_domains, bool):
+            raise TypeError("all_domains must be a bool")
+
+        domain = domain.strip()
+        if domain and all_domains:
+            raise ValueError("domain and all_domains are mutually exclusive")
         if domain:
-            params["domain"] = domain
+            params: dict[str, Any] = {"domain": domain}
+        elif all_domains:
+            params = {"all_domains": True}
+        else:
+            raise ValueError("cookie scope required: pass domain='example.com' or all_domains=True")
         result = self._call("get_cookies", params)
         return result if isinstance(result, list) else []
 
@@ -849,9 +861,22 @@ def _truncate(value: Any, limit: int = 300) -> str:
     return text if len(text) <= limit else text[:limit] + f"...({len(text)} chars)"
 
 
-if os.environ.get("CHROME_BRIDGE_DEBUG"):  # pragma: no cover - opt-in tracing
-    logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
+def _configure_debug_logging() -> None:
+    """Enable bridge RPC tracing without exposing authenticated WebSocket frames."""
+    if not _LOG.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        _LOG.addHandler(handler)
     _LOG.setLevel(logging.DEBUG)
+    _LOG.propagate = False
+    # websockets DEBUG logs include complete frame bodies, including the bridge
+    # token and cookie results. Never enable them as a side effect of our flag.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
+
+
+if os.environ.get("CHROME_BRIDGE_DEBUG"):  # pragma: no cover - opt-in tracing
+    _configure_debug_logging()
 
 
 # ─────────────────────────── CLI ───────────────────────────
@@ -891,6 +916,12 @@ def main(argv: list[str] | None = None) -> int:
     def add(name: str, help_text: str) -> argparse.ArgumentParser:
         return sub.add_parser(name, help=help_text, parents=[common])
 
+    def cookie_domain(value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise argparse.ArgumentTypeError("cookie domain must not be empty")
+        return value
+
     p_eval = add("eval", "evaluate a JS expression")
     p_eval.add_argument("expression")
 
@@ -909,8 +940,22 @@ def main(argv: list[str] | None = None) -> int:
     p_shot.add_argument("--selector")
     p_shot.add_argument("--out", default="screenshot.png")
 
-    p_cookies = add("cookies", "dump cookies")
-    p_cookies.add_argument("--domain", default="")
+    p_cookies = add(
+        "cookies",
+        "list cookie metadata; values are redacted unless explicitly revealed",
+    )
+    cookie_scope = p_cookies.add_mutually_exclusive_group(required=True)
+    cookie_scope.add_argument("--domain", type=cookie_domain)
+    cookie_scope.add_argument(
+        "--all-domains",
+        action="store_true",
+        help="list every cookie in the Chrome profile (sensitive metadata)",
+    )
+    p_cookies.add_argument(
+        "--show-values",
+        action="store_true",
+        help="include cookie values in stdout (sensitive; values are redacted by default)",
+    )
 
     add("status", "server + extension health")
     add("list-tabs", "every open tab")
@@ -958,7 +1003,12 @@ def main(argv: list[str] | None = None) -> int:
                 fh.write(data)
             out = {"written": args.out, "bytes": len(data)}
         elif args.cmd == "cookies":
-            out = target.get_cookies(args.domain)
+            cookies = target.get_cookies(args.domain or "", all_domains=args.all_domains)
+            out = (
+                cookies
+                if args.show_values
+                else [{**cookie, "value": "<redacted>"} for cookie in cookies]
+            )
         elif args.cmd == "list-tabs":
             out = page.list_tabs()
         elif args.cmd == "list-sessions":

@@ -22,8 +22,9 @@ signed into.
 ## Why this exists
 
 When you ask an agent to "log in to my Notion, find page X, screenshot it"
-or "pull my last 10 xiaohongshu posts", the agent has three off-the-shelf
-options. **All three are bad for anything behind a login.**
+or "pull my last 10 xiaohongshu posts", the agent commonly reaches for one
+of three browser approaches. Most do not share the local profile that is
+already signed in.
 
 ### Option 1 — Playwright / Puppeteer / Selenium (headless or headed)
 
@@ -42,14 +43,13 @@ The agent launches a *fresh* Chromium process with an empty profile. That means:
 - **Per-project setup.** Every agent project needs its own browser binary
   install, its own driver, its own login flow.
 
-### Option 2 — Agent-built-in `browse_*` tools (Claude, Codex, Goose, …)
+### Option 2 — Hosted or isolated agent browser tools
 
-Modern coding agents ship a built-in browser tool that runs in the cloud
-(Claude Code's `browser_navigate` / `browser_console` / `browser_snapshot`,
-Codex's web tool, etc.). They're great for *public* pages, but:
+Many coding agents offer a browser that runs in a hosted or isolated
+environment. These tools are great for *public* pages, but commonly:
 
-- **Runs on a remote, ephemeral Chromium**, not on your machine. There is
-  no way to give it your session — your cookies live in your local browser.
+- **Run without your local Chrome profile.** Your cookies and extensions stay
+  in the browser on your machine.
 - **DOM snapshots truncate** at a few hundred elements on large SPAs
   (Next.js, virtualised lists). Re-snapshotting doesn't help.
 - **State doesn't persist** between calls reliably. Multi-step
@@ -57,6 +57,10 @@ Codex's web tool, etc.). They're great for *public* pages, but:
 - **Some sites refuse the tool's User-Agent / IP range** outright, especially
   Chinese sites (xiaohongshu, bilibili, zhihu) and anything behind
   Cloudflare's strict mode.
+
+Some hosts also provide a native integration with an existing Chrome profile.
+Prefer that integration when it can reach the required profile; Chrome Bridge
+fills the gap when it cannot.
 
 ### Option 3 — Browser MCP servers (puppeteer-mcp, browserbase, etc.)
 
@@ -123,9 +127,18 @@ pip install -e .              # standard pip, picks up pyproject.toml
 extension support) on the same machine. The only runtime dependency is
 `websockets>=12.0`.
 
+### Upgrading from 1.1
+
+Version 2.0 intentionally breaks the old implicit full-profile cookie export.
+`page.get_cookies()` and `chrome-bridge cookies` now require either one domain
+or an explicit all-domain opt-in. Restart the relay and reload the unpacked
+extension after upgrading. `chrome-bridge status` should show both
+`server_version` and `extension_version` as `2.0.0`.
+
 ### Step 2 — Load the Chrome extension (one-time)
 
-1. Open `chrome://extensions` in the same Chrome you use daily.
+1. Open `chrome://extensions` in the Chrome profile you intend to expose.
+   A dedicated automation profile is safer than your daily browsing profile.
 2. Toggle **Developer mode** (top right).
 3. Click **Load unpacked**, select the `extension/` directory of this
    repo.
@@ -141,8 +154,8 @@ extension support) on the same machine. The only runtime dependency is
    <code>manifest.json</code> declares. Without flipping this to "On all
    sites":
 
-   - `page.get_cookies()` will return only cookies for domains the user
-     has individually granted (often empty).
+   - `page.get_cookies(domain="example.com")` will return only cookies for
+     domains the user has individually granted (often empty).
    - `page.navigate` / `page.evaluate` will still work on the *active*
      tab via `activeTab`, but fail mysteriously on background tabs.
 
@@ -161,7 +174,7 @@ uv run python scripts/bridge_server.py
 Output will look roughly like:
 
 ```
-INFO:chrome-bridge:Chrome Bridge server 1.1.0 listening on ws://localhost:9333
+INFO:chrome-bridge:Chrome Bridge server 2.0.0 listening on ws://localhost:9333
 INFO:chrome-bridge:auth enabled; token at /Users/you/.chrome-bridge-token
 INFO:chrome-bridge:waiting for the Chrome extension to connect...
 INFO:chrome-bridge:extension connected
@@ -179,7 +192,7 @@ first start; the Python client picks it up automatically. See
 
 ```bash
 python3 scripts/bridge_client.py status
-# {"extension_connected": true, "pending": 0, "server_version": "1.1.0"}
+# {"extension_connected": true, "pending": 0, "server_version": "2.0.0"}
 
 python3 scripts/bridge_client.py eval 'document.title' --url https://example.com
 # "Example Domain"
@@ -229,8 +242,8 @@ This is the kind of thing every other tool fails at:
 
 - Playwright: gets blocked by xiaohongshu's bot detection within seconds.
 - Headless Chrome: same.
-- Claude's built-in `browser_*`: xiaohongshu's edge blocks it
-  geographically and by IP range.
+- Hosted browser tools: xiaohongshu's edge may block their region or IP
+  range, and they do not carry your local signed-in profile.
 - Chrome Bridge Agent: works trivially, because **you're already logged
   in to xiaohongshu in your real Chrome**.
 
@@ -384,14 +397,14 @@ This repo is also a valid [Agent Skills](https://agentskills.io) package
 `chrome-bridge-agent/` directory into your agent's skills directory, or
 symlink it:
 
-- **Claude Code**: `ln -s $(pwd)/chrome-bridge-agent ~/.claude/skills/`
-- **OpenAI Codex**: see [Codex skills docs](https://developers.openai.com/codex/skills/)
+- **Claude Code**: `mkdir -p ~/.claude/skills && ln -s "$(pwd)" ~/.claude/skills/chrome-bridge-agent`
+- **OpenAI Codex**: see the [Codex setup note](references/codex.md)
 - **opencode**: drop into `.opencode/skills/`
 - **Goose**: see [Goose skills docs](https://block.github.io/goose/docs/guides/context-engineering/using-skills/)
 - **Hermes / other agentskills.io-compatible runtimes**: same — place under their skills root.
 
-The agent will pick up `SKILL.md` automatically and call into the bridge
-when the user asks for browser automation.
+The agent will pick up `SKILL.md` automatically (some hosts do so on the next
+turn) and call into the bridge when the user asks for browser automation.
 
 ---
 
@@ -465,8 +478,14 @@ integration tests (no headed Chrome in GitHub runners).
 
 Chrome Bridge Agent runs the agent's commands in your real browser profile.
 Anything that can talk to the relay can do anything you can do while logged
-in — including `get_cookies()`, which returns session cookies for every
-domain. **Treat the relay like an open shell on your browser.**
+in — including an explicit `get_cookies(all_domains=True)` request, which
+returns session cookies for every domain. **Treat the relay like an open shell
+on your browser.** Ordinary cookie reads require a domain; no-argument calls
+fail closed. The CLI equivalent for a full-profile export is the deliberately
+named `cookies --all-domains` flag.
+Cookie CLI output redacts values unless `--show-values` is passed. Avoid that
+flag in agent-visible terminals; use the Python API in-process when a workflow
+needs a value and do not log it.
 
 Loopback is *not* a boundary on its own: `ws://localhost` counts as a
 potentially-trustworthy origin, so an ordinary `https://` page is allowed to

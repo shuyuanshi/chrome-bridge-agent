@@ -108,9 +108,8 @@ class TestSessions:
         measured on a real browser, removal lands anywhere between a few
         milliseconds and (with an unfocused window and a queue of pending
         removals) over a minute. Blocking on that turned successful closes into
-        spurious TIMEOUTs, so the contract is "the close is issued and the tab
-        is deregistered", and `confirmed` tells you whether Chrome had already
-        finished.
+        spurious TIMEOUTs. A pending close stops logical routing immediately but
+        remains bridge-owned (and CSP-scoped) until Chrome emits `onRemoved`.
         """
         started = time.monotonic()
         with page.tab(EXAMPLE) as tab:
@@ -119,8 +118,17 @@ class TestSessions:
         assert time.monotonic() - started < 60, "closing the session blocked for too long"
 
         assert all(s["tab_id"] != tab_id for s in page.list_sessions())
-        still_owned = [t for t in page.list_tabs() if t["tab_id"] == tab_id and t["bridge_owned"]]
-        assert not still_owned, "tab is still registered as a live bridge session"
+        remaining = [t for t in page.list_tabs() if t["tab_id"] == tab_id]
+        if remaining:
+            assert remaining[0]["bridge_owned"], "a live pending-close tab lost CSP ownership"
+
+        deadline = time.monotonic() + 90
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.25)
+            remaining = [t for t in page.list_tabs() if t["tab_id"] == tab_id]
+            if remaining:
+                assert remaining[0]["bridge_owned"], "pending tab was deregistered before removal"
+        assert not remaining, "Chrome did not finish removing the tab within 90 seconds"
 
     def test_a_tab_id_that_never_existed_is_reported_as_gone(self, page: BridgePage) -> None:
         with pytest.raises(TabGoneError):
@@ -184,6 +192,11 @@ class TestAgentPrimitives:
             snap = tab.snapshot()
             with pytest.raises(StaleRefError):
                 tab.act(snap["elements"][0]["ref"], "click", snapshot_id="not-the-current-one")
+
+    def test_rapid_anonymous_sessions_open_and_close(self, page: BridgePage) -> None:
+        for _ in range(5):
+            with page.tab(EXAMPLE, settle_ms=0) as tab:
+                assert tab.evaluate("document.title") == "Example Domain"
 
     def test_fetch_uses_the_page_session(self, page: BridgePage, local_site: str) -> None:
         with page.tab(f"{local_site}/") as tab:

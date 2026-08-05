@@ -6,6 +6,8 @@ These run in CI without Chrome.
 from __future__ import annotations
 
 import inspect
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -100,6 +102,29 @@ def test_import_bridge_client() -> None:
     assert bridge_client.BRIDGE_URL == "ws://localhost:9333"
 
 
+def test_release_version_is_coordinated() -> None:
+    from bridge_server import SERVER_VERSION  # noqa: PLC0415
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    skill = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    manifest = json.loads((REPO_ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
+
+    project_match = re.search(r'(?m)^version = "([^"]+)"$', pyproject)
+    lock_match = re.search(r'(?m)^name = "chrome-bridge-agent"\nversion = "([^"]+)"$', lock)
+    skill_match = re.search(r'(?m)^  version: "([^"]+)"$', skill)
+    assert project_match and lock_match and skill_match
+
+    versions = {
+        "project": project_match.group(1),
+        "lock": lock_match.group(1),
+        "manifest": manifest["version"],
+        "server": SERVER_VERSION,
+        "skill": skill_match.group(1),
+    }
+    assert len(set(versions.values())) == 1, versions
+
+
 def test_error_hierarchy() -> None:
     """Every typed error is catchable as BridgeError, and codes are unique."""
     import bridge_client as bc  # noqa: PLC0415
@@ -173,6 +198,16 @@ def test_is_server_running_returns_bool_when_offline() -> None:
     assert page.is_server_running() is False
     assert page.is_extension_connected() is False
     assert page.status()["error"] == "CONNECTION_FAILED"
+
+
+def test_connection_error_names_installed_and_source_server_commands() -> None:
+    from bridge_client import BridgeConnectionError, BridgePage  # noqa: PLC0415
+
+    with pytest.raises(BridgeConnectionError) as excinfo:
+        BridgePage(bridge_url="ws://localhost:1").evaluate("1")
+    message = str(excinfo.value)
+    assert "chrome-bridge-server" in message
+    assert "python3 scripts/bridge_server.py" in message
 
 
 def test_cli_entrypoint_exists_and_reports_failure() -> None:
