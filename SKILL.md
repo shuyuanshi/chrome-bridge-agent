@@ -102,13 +102,22 @@ running an old service worker: run `chrome-bridge reload`
 session-scoped verbs would quietly act on the shared managed tab.
 
 - `{"error": "CONNECTION_FAILED"}` → start `chrome-bridge-server --no-watch`
-  in a host-managed long-running process, wait ~2 s, and re-check. Keep that
-  process only while browser work is active; do not assume a detached shell
-  child will survive after its shell exits. Stop the relay when the task ends
-  unless the user requests otherwise. `--no-watch` prevents an installation
-  update from reloading Chrome and discarding live sessions unexpectedly.
-- `{"extension_connected": false}` → **stop and ask the user.** The extension
-  install is a one-time manual action; don't try to script it:
+  in a host-managed long-running process. Keep that process only while browser
+  work is active; do not assume a detached shell child will survive after its
+  shell exits. Stop the relay when the task ends unless the user requests
+  otherwise. `--no-watch` prevents an installation update from reloading
+  Chrome and discarding live sessions unexpectedly.
+- After the relay answers, **automatically poll `chrome-bridge status` for up
+  to 35 seconds** before asking the user to touch Chrome. An enabled MV3
+  extension reconnects on exponential backoff (capped at 30 seconds) and a
+  24-second alarm; the first status response can therefore say
+  `"extension_connected": false` even though recovery is already in progress.
+  Continue immediately when it becomes `true`. Do not mistake one early probe
+  for a disabled or missing extension, and do not request a manual reload yet.
+- If `{"extension_connected": false}` persists for the full 35-second recovery
+  window, **stop and ask the user.** A disconnected extension cannot receive
+  the bridge's `reload` command, so the remaining install/enable/reload step is
+  manual:
 
   > Chrome Bridge extension isn't connected. One-time setup:
   > 1. Open `chrome://extensions`
