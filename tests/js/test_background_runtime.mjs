@@ -13,11 +13,16 @@ async function harness(options = {}) {
   const cookieCalls = [];
   const cspUpdates = [];
   const storageWrites = [];
+  const failureStorageWrites = [];
+  const websocketFrames = [];
+  const clearedTimeouts = [];
   const warnings = [];
   const windowCreates = [];
   const windowUpdates = [];
   const windows = new Map([[1, { id: 1, type: "normal", state: "normal", focused: true }]]);
   let storedState = options.initialState ? plain(options.initialState) : null;
+  let storedFailures = options.initialFailureQueue ? plain(options.initialFailureQueue) : [];
+  let latestSocket = null;
   let nextTabId = 1;
   let nextWindowId = 2;
   let createCount = 0;
@@ -65,7 +70,7 @@ async function harness(options = {}) {
       },
     },
     runtime: {
-      getManifest: () => ({ version: "test" }),
+      getManifest: () => ({ version: options.manifestVersion || "test" }),
       reload() {},
     },
     scripting: {
@@ -82,6 +87,17 @@ async function harness(options = {}) {
         async set(value) {
           storedState = plain(value.state);
           storageWrites.push(plain(value.state));
+        },
+      },
+      local: {
+        async get(key) {
+          if (options.failureStorageGetError) throw new Error("failure storage get failed");
+          return { [key]: plain(storedFailures) };
+        },
+        async set(value) {
+          if (options.failureStorageSetError) throw new Error("failure storage set failed");
+          storedFailures = plain(value.failureQueueV1 || []);
+          failureStorageWrites.push(plain(storedFailures));
         },
       },
     },
@@ -218,12 +234,39 @@ async function harness(options = {}) {
 
     constructor() {
       this.readyState = FakeWebSocket.CONNECTING;
+      latestSocket = this;
+    }
+
+    send(raw) {
+      if (options.websocketSendError) throw new Error("websocket send failed");
+      websocketFrames.push(JSON.parse(raw));
+    }
+
+    async open() {
+      this.readyState = FakeWebSocket.OPEN;
+      await this.onopen?.({});
+    }
+
+    async message(value) {
+      await this.onmessage?.({ data: typeof value === "string" ? value : JSON.stringify(value) });
+    }
+
+    async error() {
+      await this.onerror?.({ type: "error" });
+    }
+
+    async close(code = 1000, wasClean = true) {
+      this.readyState = 3;
+      await this.onclose?.({ code, wasClean });
     }
   }
 
   const context = vm.createContext({
     chrome,
-    clearTimeout,
+    clearTimeout: options.clearTimeout || ((id) => {
+      clearedTimeouts.push(id);
+      clearTimeout(id);
+    }),
     console: {
       log() {},
       warn(...args) {
@@ -236,6 +279,7 @@ async function harness(options = {}) {
   });
   vm.runInContext(source, context, { filename: "background.js" });
   await vm.runInContext("_hydrated", context);
+  await vm.runInContext("_failureQueueHydrated", context);
 
   return {
     context,
@@ -244,11 +288,16 @@ async function harness(options = {}) {
     cookieCalls,
     cspUpdates,
     storageWrites,
+    failureStorageWrites,
+    websocketFrames,
+    clearedTimeouts,
     warnings,
     windowCreates,
     windowUpdates,
     emitRemoved,
     storedState: () => (storedState ? plain(storedState) : null),
+    storedFailureQueue: () => plain(storedFailures),
+    socket: () => latestSocket,
     cspTabIds: () => {
       const last = cspUpdates.at(-1);
       return last?.addRules?.[0]?.condition?.tabIds || [];
@@ -1110,6 +1159,8 @@ async function testDelayedChildIsDiscardedWhileParentCloseIsPending() {
 
   const result = plain(await evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})'));
   assert.deepEqual(result.pending, [String(parent.id)]);
+  assert.equal(result.failure_id, undefined);
+  assert.deepEqual(state.storedFailureQueue(), []);
   const child = await evaluate(
     state,
     `chrome.tabs.create({url:"https://child.example", active:false, windowId:${parent.windowId}, openerTabId:${parent.id}})`,
@@ -1296,6 +1347,231 @@ async function testCookieScopeIsStrictAndExplicit() {
   await assert.rejects(evaluate(state, "cmdGetCookies({domain:42})"), /cookie scope required/);
 }
 
+async function testCommandFailureIsPersistedAndFlushedWithoutSensitiveInputs() {
+  const canary = "PRIVATE_URL_https://secret.example/?cookie=TOPSECRET";
+  const state = await harness({
+    async executeScript() {
+      return [{ result: { __bridge_error: { code: "JS_ERROR", message: canary, detail: { stack: canary } } } }];
+    },
+  });
+  await state.socket().open();
+
+  await state.socket().message({
+    id: "request-1",
+    method: "evaluate",
+    params: { expression: canary },
+  });
+  await evaluate(state, "_failureQueueTail");
+  await evaluate(state, "_failureFlushTail");
+
+  const stored = state.storedFailureQueue();
+  const batches = state.websocketFrames.filter((frame) => frame.type === "failure_batch");
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].code, "JS_ERROR");
+  assert.equal(stored[0].operation, "evaluate");
+  assert.equal(JSON.stringify(stored).includes(canary), false);
+  assert.equal(JSON.stringify(batches).includes(canary), false);
+  const reply = state.websocketFrames.find((frame) => frame.id === "request-1");
+  assert.equal(reply.error.failure_id, stored[0].event_id);
+}
+
+async function testRelayDownQueueSurvivesRestartAndAckClearsIt() {
+  const first = await harness();
+  await evaluate(
+    first,
+    'recordExtensionFailure("RELAY_UNREACHABLE", "extension_connection", "connect", {retryable:true})',
+  );
+  const persisted = first.storedFailureQueue();
+  assert.equal(persisted.length, 1);
+
+  const second = await harness({ initialFailureQueue: persisted });
+  await second.socket().open();
+  await evaluate(second, "_failureFlushTail");
+  const batch = second.websocketFrames.find((frame) => frame.type === "failure_batch");
+  assert.equal(batch.events.length, 1);
+  assert.equal(batch.events[0].event_id, persisted[0].event_id);
+
+  await second.socket().message({ type: "failure_ack", event_ids: [persisted[0].event_id] });
+  await evaluate(second, "_failureQueueTail");
+  assert.deepEqual(second.storedFailureQueue(), []);
+}
+
+async function testEmptyAckSchedulesBoundedRetryUntilTheQueueIsDurable() {
+  const scheduled = [];
+  const cleared = [];
+  const state = await harness({
+    setTimeout(callback, delay) {
+      scheduled.push({ callback, delay });
+      return scheduled.length;
+    },
+    clearTimeout(id) {
+      cleared.push(id);
+    },
+  });
+  await evaluate(
+    state,
+    'recordExtensionFailure("JS_ERROR", "evaluate", "command", {retryable:false})',
+  );
+  const [event] = state.storedFailureQueue();
+  await state.socket().open();
+
+  await state.socket().message({
+    type: "failure_ack",
+    event_ids: [],
+    retry_after_ms: 60_000,
+  });
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, 60_000);
+  assert.equal(await evaluate(state, "_failureRetryTimer !== null"), true);
+
+  await state.socket().message({ type: "failure_ack", event_ids: [event.event_id] });
+  assert.equal(await evaluate(state, "_failureRetryTimer"), null);
+  assert.deepEqual(cleared, [1]);
+}
+
+async function testMalformedStructuredRelayFrameIsJournaled() {
+  const state = await harness();
+  await state.socket().open();
+  await state.socket().message(null);
+  await evaluate(state, "_failureQueueTail");
+
+  const stored = state.storedFailureQueue();
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].code, "PROTOCOL_INVALID_FRAME");
+  assert.equal(stored[0].operation, "protocol");
+}
+
+async function testExpectedRelayIdleDoesNotFloodFailureQueue() {
+  const neverConnected = await harness();
+  await neverConnected.socket().error();
+  await neverConnected.socket().close(1006, false);
+  assert.deepEqual(neverConnected.storedFailureQueue(), []);
+
+  const outage = await harness();
+  await outage.socket().open();
+  await outage.socket().error();
+  await outage.socket().close(1006, false);
+  await evaluate(outage, "_failureQueueTail");
+  assert.equal(outage.storedFailureQueue().length, 1);
+  assert.equal(outage.storedFailureQueue()[0].code, "RELAY_UNREACHABLE");
+
+  const cleanStop = await harness();
+  await cleanStop.socket().open();
+  await cleanStop.socket().close(1000, true);
+  await cleanStop.socket().error();
+  assert.deepEqual(cleanStop.storedFailureQueue(), []);
+}
+
+async function testPersistedFailureQueueIsBoundedExpiredAndSanitized() {
+  const now = Date.now();
+  const canary = "PRIVATE_https://secret.example/?token=hidden";
+  const events = [
+    {
+      event_id: "f".repeat(32),
+      occurred_at_ms: now - 8 * 24 * 60 * 60 * 1000,
+      code: "JS_ERROR",
+      operation: "evaluate",
+      phase: "command",
+    },
+  ];
+  for (let index = 0; index < 105; index += 1) {
+    events.push({
+      event_id: index.toString(16).padStart(32, "0"),
+      occurred_at_ms: now,
+      code: index === 104 ? canary : "JS_ERROR",
+      operation: index === 104 ? canary : "evaluate",
+      phase: "command",
+      message: canary,
+      params: { url: canary },
+    });
+  }
+
+  const state = await harness({ initialFailureQueue: events });
+  const stored = state.storedFailureQueue();
+  assert.equal(stored.length, 100);
+  assert.equal(JSON.stringify(stored).includes(canary), false);
+  assert.ok(JSON.stringify(stored).length <= 64 * 1024);
+  assert.equal(stored.at(-1).code, "INTERNAL");
+  assert.equal(stored.at(-1).operation, "unknown");
+
+  const expiryOnly = await harness({
+    initialFailureQueue: [
+      {
+        event_id: "e".repeat(32),
+        occurred_at_ms: now - 8 * 24 * 60 * 60 * 1000,
+        code: "JS_ERROR",
+        operation: "evaluate",
+        phase: "command",
+      },
+      {
+        event_id: "d".repeat(32),
+        occurred_at_ms: now,
+        code: "JS_ERROR",
+        operation: "evaluate",
+        phase: "command",
+      },
+    ],
+  });
+  assert.deepEqual(
+    expiryOnly.storedFailureQueue().map((event) => event.event_id),
+    ["d".repeat(32)],
+  );
+}
+
+async function testHydrationPreservesTheVersionThatActuallyFailed() {
+  const now = Date.now();
+  const state = await harness({
+    manifestVersion: "2.2.0",
+    initialFailureQueue: [
+      {
+        event_id: "d".repeat(32),
+        occurred_at_ms: now,
+        code: "JS_ERROR",
+        operation: "evaluate",
+        phase: "command",
+        extension_version: "2.1.0",
+      },
+    ],
+  });
+
+  assert.equal(state.storedFailureQueue()[0].extension_version, "2.1.0");
+}
+
+async function testRepeatedFailuresUseImmutableIdsAndStorageFailureFallsBackSafely() {
+  const state = await harness();
+  await evaluate(
+    state,
+    'recordExtensionFailure("RELAY_UNREACHABLE", "extension_connection", "connect", {retryable:true})',
+  );
+  await evaluate(
+    state,
+    'recordExtensionFailure("RELAY_UNREACHABLE", "extension_connection", "connect", {retryable:true})',
+  );
+  const stored = state.storedFailureQueue();
+  assert.equal(stored.length, 2);
+  assert.notEqual(stored[0].event_id, stored[1].event_id);
+  assert.equal(stored[0].count, 1);
+  assert.equal(stored[1].count, 1);
+
+  await state.socket().open();
+  await state.socket().message({ type: "failure_ack", event_ids: [stored[0].event_id] });
+  await evaluate(state, "_failureQueueTail");
+  assert.deepEqual(
+    state.storedFailureQueue().map((event) => event.event_id),
+    [stored[1].event_id],
+  );
+  await state.socket().message({ type: "failure_ack", event_ids: [stored[1].event_id] });
+  assert.deepEqual(state.storedFailureQueue(), []);
+
+  const broken = await harness({ failureStorageSetError: true });
+  const id = await evaluate(
+    broken,
+    'recordExtensionFailure("STATE_PERSIST_FAILED", "state", "persist", {retryable:true})',
+  );
+  assert.equal(typeof id, "string");
+  assert.equal(await evaluate(broken, "_failureMemoryFallback.length"), 1);
+}
+
 await testTransientTabTeardownRetriesUntilDeadline();
 await testNonTransientCreationFailureClosesTheTab();
 await testFrameLossOnALiveTabDoesNotRetry();
@@ -1333,3 +1609,11 @@ await testTabReplacementTransfersOwnershipAndRoutes();
 await testForegroundingFailsClosedByDefault();
 await testForegroundTrustedInputHoldsTheAutomationWindowLock();
 await testCookieScopeIsStrictAndExplicit();
+await testCommandFailureIsPersistedAndFlushedWithoutSensitiveInputs();
+await testRelayDownQueueSurvivesRestartAndAckClearsIt();
+await testEmptyAckSchedulesBoundedRetryUntilTheQueueIsDurable();
+await testMalformedStructuredRelayFrameIsJournaled();
+await testExpectedRelayIdleDoesNotFloodFailureQueue();
+await testPersistedFailureQueueIsBoundedExpiredAndSanitized();
+await testHydrationPreservesTheVersionThatActuallyFailed();
+await testRepeatedFailuresUseImmutableIdsAndStorageFailureFallsBackSafely();

@@ -15,10 +15,250 @@
 const BRIDGE_URL = "ws://localhost:9333";
 const CSP_RULE_ID = 9999;
 const MAX_INLINE_CHARS = 4_000_000; // 更大的结果走 __cb_buf 分块读
+const FAILURE_QUEUE_KEY = "failureQueueV1";
+const MAX_EXTENSION_FAILURES = 100;
+const MAX_EXTENSION_FAILURE_BYTES = 64 * 1024;
+const MAX_EXTENSION_FAILURE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 let ws = null;
 let _reconnectDelay = 1000;
 let _reconnectTimer = null;
+
+// ───────────────────────── 隐私安全的失败队列 ─────────────────────────
+// The queue is local-first because a broken relay cannot receive the event
+// that says it is broken. Events contain only fixed enums and numbers: never
+// command params, URLs, selectors, JavaScript, page text, cookies, or stacks.
+
+const SAFE_FAILURE_CODES = new Set([
+  "BAD_REQUEST",
+  "CLEANUP_INCOMPLETE",
+  "CSP_SYNC_FAILED",
+  "DEBUGGER_BUSY",
+  "ELEMENT_NOT_FOUND",
+  "EXTENSION_DISCONNECTED",
+  "FETCH_FAILED",
+  "FOREGROUND_REQUIRED",
+  "HANDSHAKE_SEND_FAILED",
+  "INTERNAL",
+  "JS_ERROR",
+  "NAV_TIMEOUT",
+  "NO_AUTOMATION_WINDOW",
+  "PAGE_ERROR",
+  "PROTOCOL_INVALID_FRAME",
+  "RELAY_UNREACHABLE",
+  "REPLY_DELIVERY_FAILED",
+  "RESTRICTED_URL",
+  "ROUTE_RESTORE_FAILED",
+  "SCOPE_CLOSING",
+  "SCREENSHOT_FAILED",
+  "STATE_HYDRATE_FAILED",
+  "STATE_PERSIST_FAILED",
+  "STALE_REF",
+  "TAB_CLOSE_FAILED",
+  "TAB_CLEANUP_FAILED",
+  "TAB_GONE",
+  "TAB_NOT_OWNED",
+  "TAB_SCOPE_MISMATCH",
+  "TAB_TRACKING_FAILED",
+  "WINDOW_STATE_FAILED",
+]);
+
+const SAFE_DIAGNOSTIC_OPERATIONS = new Set([
+  "act_ref", "activate_tab", "browse_and_eval", "browse_close", "browse_do", "browse_open",
+  "cdp_mouse", "click_element", "close_owned_tabs", "dispatch_wheel_event", "evaluate",
+  "evaluate_function", "extension_connection", "get_cookies", "get_element_attribute",
+  "get_element_text", "get_elements_count", "get_html", "get_scroll_top", "get_text",
+  "get_url", "get_viewport_height", "has_element", "hover_element", "input_content_editable",
+  "input_text", "list_sessions", "list_tabs", "mouse_click", "mouse_move", "navigate",
+  "page_fetch", "press_key", "protocol", "read_buffer", "reload_self", "remove_element",
+  "screenshot", "screenshot_element", "scroll_by", "scroll_element_into_view",
+  "scroll_nth_element_into_view", "scroll_to", "scroll_to_bottom", "select_all_text",
+  "select_option", "set_file_input", "snapshot", "state", "type_text", "wait_dom_stable",
+  "wait_for_load", "wait_for_selector", "window_lifecycle",
+]);
+
+const SAFE_FAILURE_PHASES = new Set([
+  "command", "connect", "decode", "delivery", "hydrate", "lifecycle", "persist", "sync",
+]);
+const SAFE_FAILURE_ID = /^(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/;
+const SAFE_EXTENSION_VERSION = /^(?:\d{1,5}(?:\.\d{1,5}){2,3}|test|unknown)$/;
+
+let _failureQueue = [];
+let _failureQueueTail = Promise.resolve();
+let _failureFlushTail = Promise.resolve();
+let _failureRetryTimer = null;
+const _failureMemoryFallback = [];
+let _relayEverOpened = false;
+let _relayOutageRecorded = false;
+
+function failureId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  let value = "";
+  for (let index = 0; index < 32; index += 1) {
+    value += Math.floor(Math.random() * 16).toString(16);
+  }
+  return value;
+}
+
+function safeFailureCode(value) {
+  return SAFE_FAILURE_CODES.has(value) ? value : "INTERNAL";
+}
+
+function safeFailureOperation(value) {
+  return SAFE_DIAGNOSTIC_OPERATIONS.has(value) ? value : "unknown";
+}
+
+function safeFailurePhase(value) {
+  return SAFE_FAILURE_PHASES.has(value) ? value : "unknown";
+}
+
+function safeExtensionVersion(value) {
+  const stored = String(value || "");
+  if (SAFE_EXTENSION_VERSION.test(stored)) return stored;
+  const current = String(chrome.runtime.getManifest().version || "");
+  return SAFE_EXTENSION_VERSION.test(current) ? current : "unknown";
+}
+
+function normalizeFailureEvent(value) {
+  if (!value || typeof value !== "object") return null;
+  if (!SAFE_FAILURE_ID.test(String(value.event_id || ""))) return null;
+  const now = Date.now();
+  const lastSeen = Number(value.last_seen_ms || value.occurred_at_ms || now);
+  const firstSeen = Number(value.first_seen_ms || lastSeen);
+  if (!Number.isFinite(lastSeen) || !Number.isFinite(firstSeen)) return null;
+  if (now - lastSeen > MAX_EXTENSION_FAILURE_AGE_MS || lastSeen - now > 60 * 60 * 1000) return null;
+  const event = {
+    event_id: String(value.event_id),
+    occurred_at_ms: lastSeen,
+    first_seen_ms: firstSeen,
+    last_seen_ms: lastSeen,
+    component: "extension",
+    code: safeFailureCode(value.code),
+    operation: safeFailureOperation(value.operation),
+    phase: safeFailurePhase(value.phase),
+    count: Math.max(1, Math.min(1_000_000, Number(value.count) || 1)),
+    retryable: value.retryable === true,
+    extension_version: safeExtensionVersion(value.extension_version),
+  };
+  if (Number.isInteger(value.websocket_close_code)) {
+    event.websocket_close_code = Math.max(0, Math.min(65535, value.websocket_close_code));
+  }
+  return event;
+}
+
+function trimFailureQueue(events) {
+  const cutoff = Date.now() - MAX_EXTENSION_FAILURE_AGE_MS;
+  const kept = events.filter((event) => event.last_seen_ms >= cutoff).slice(-MAX_EXTENSION_FAILURES);
+  while (kept.length && JSON.stringify(kept).length > MAX_EXTENSION_FAILURE_BYTES) kept.shift();
+  return kept;
+}
+
+const _failureQueueHydrated = (async () => {
+  try {
+    if (!chrome.storage?.local) return;
+    const stored = await chrome.storage.local.get(FAILURE_QUEUE_KEY);
+    const raw = stored && stored[FAILURE_QUEUE_KEY];
+    _failureQueue = trimFailureQueue(
+      (Array.isArray(raw) ? raw : []).map(normalizeFailureEvent).filter(Boolean),
+    );
+    // Rewrite through the allowlist so stale/manual storage cannot retain or
+    // later replay arbitrary fields that this version would never create.
+    await chrome.storage.local.set({ [FAILURE_QUEUE_KEY]: _failureQueue });
+  } catch {
+    // Do not recurse when the diagnostic store itself is unavailable.
+    console.warn("[Chrome Bridge] failure queue hydrate failed");
+  }
+})();
+
+async function writeFailureQueueNow() {
+  if (!chrome.storage?.local) return;
+  await chrome.storage.local.set({ [FAILURE_QUEUE_KEY]: _failureQueue });
+}
+
+async function acknowledgeFailures(ids) {
+  if (!Array.isArray(ids) || !ids.length) return;
+  await _failureQueueHydrated;
+  const accepted = new Set(ids.filter((id) => SAFE_FAILURE_ID.test(String(id))));
+  const update = async () => {
+    _failureQueue = _failureQueue.filter((event) => !accepted.has(event.event_id));
+    await writeFailureQueueNow();
+  };
+  const task = _failureQueueTail.then(update, update);
+  _failureQueueTail = task.catch(() => {});
+  await task.catch(() => {});
+}
+
+function clearFailureRetry() {
+  if (_failureRetryTimer !== null) clearTimeout(_failureRetryTimer);
+  _failureRetryTimer = null;
+}
+
+function scheduleFailureRetry(delayMs = 60_000) {
+  if (_failureRetryTimer !== null) return;
+  const boundedDelay = Math.max(1000, Math.min(5 * 60_000, Number(delayMs) || 60_000));
+  _failureRetryTimer = setTimeout(() => {
+    _failureRetryTimer = null;
+    void flushExtensionFailures(ws).catch(() => {});
+  }, boundedDelay);
+}
+
+function flushExtensionFailures(socket = ws) {
+  const flush = async () => {
+    await _failureQueueHydrated;
+    await _failureQueueTail;
+    if (!socket || socket !== ws || socket.readyState !== WebSocket.OPEN) return;
+    for (let index = 0; index < _failureQueue.length; index += 25) {
+      socket.send(
+        JSON.stringify({
+          type: "failure_batch",
+          schema: 1,
+          events: _failureQueue.slice(index, index + 25),
+        }),
+      );
+    }
+  };
+  const task = _failureFlushTail.then(flush, flush);
+  _failureFlushTail = task.catch(() => {});
+  return task;
+}
+
+async function recordExtensionFailure(code, operation, phase, options = {}) {
+  const now = Date.now();
+  const event = normalizeFailureEvent({
+    event_id: failureId(),
+    occurred_at_ms: now,
+    first_seen_ms: now,
+    last_seen_ms: now,
+    code: safeFailureCode(code),
+    operation: safeFailureOperation(operation),
+    phase: safeFailurePhase(phase),
+    count: 1,
+    retryable: options.retryable === true,
+    websocket_close_code: options.websocket_close_code,
+  });
+  if (!event) return null;
+  await _failureQueueHydrated;
+  const update = async () => {
+    // IDs are immutable. Reusing an in-flight ID for a newer occurrence lets
+    // an older ACK delete data that the relay has not seen yet.
+    _failureQueue.push(event);
+    _failureQueue = trimFailureQueue(_failureQueue);
+    await writeFailureQueueNow();
+  };
+  const task = _failureQueueTail.then(update, update);
+  _failureQueueTail = task.catch(() => {});
+  try {
+    await task;
+  } catch {
+    _failureMemoryFallback.push(event);
+    if (_failureMemoryFallback.length > 20) _failureMemoryFallback.shift();
+    console.warn("[Chrome Bridge] failure queue persist failed");
+  }
+  await flushExtensionFailures(ws).catch(() => {});
+  return event.event_id;
+}
 
 // ───────────────────────── 持久化状态 ─────────────────────────
 // MV3 的 service worker 随时会被回收，纯内存状态会丢。tab_id 直接用
@@ -127,6 +367,9 @@ function persistState() {
       });
     } catch (e) {
       console.warn("[Chrome Bridge] state persist failed", e);
+      void recordExtensionFailure("STATE_PERSIST_FAILED", "state", "persist", {
+        retryable: true,
+      });
     }
   });
   _persistStateTail = write;
@@ -190,6 +433,7 @@ function syncCspRule() {
       });
     } catch (e) {
       console.warn("[Chrome Bridge] CSP rule sync failed", e);
+      void recordExtensionFailure("CSP_SYNC_FAILED", "state", "sync", { retryable: true });
     }
   });
   _cspSyncTail = update;
@@ -199,7 +443,10 @@ function syncCspRule() {
 // 一次性清理：干掉 <=1.0.3 留下的、对所有站点永久生效的持久化规则。
 chrome.declarativeNetRequest
   .updateDynamicRules({ removeRuleIds: [CSP_RULE_ID] })
-  .catch((e) => console.warn("[Chrome Bridge] legacy CSP rule cleanup failed", e));
+  .catch((e) => {
+    console.warn("[Chrome Bridge] legacy CSP rule cleanup failed", e);
+    void recordExtensionFailure("CSP_SYNC_FAILED", "state", "sync", { retryable: true });
+  });
 
 // SW 每次激活都要把状态捞回来；命令处理前会 await 这个 promise。
 const _hydrated = (async () => {
@@ -237,6 +484,9 @@ const _hydrated = (async () => {
     await syncCspRule();
   } catch (e) {
     console.warn("[Chrome Bridge] state hydrate failed", e);
+    void recordExtensionFailure("STATE_HYDRATE_FAILED", "state", "hydrate", {
+      retryable: true,
+    });
   }
 })();
 
@@ -371,14 +621,27 @@ function connect() {
 
   ws = new WebSocket(BRIDGE_URL);
 
-  ws.onopen = () => {
+  ws.onopen = async () => {
     console.log("[Chrome Bridge] connected to bridge server");
+    _relayEverOpened = true;
+    _relayOutageRecorded = false;
+    clearFailureRetry();
     _reconnectDelay = 1000;
     // The version lets the relay (and `status`) spot a stale service worker
     // that predates tab_id routing, instead of quietly using the wrong tab.
-    ws.send(
-      JSON.stringify({ role: "extension", version: chrome.runtime.getManifest().version }),
-    );
+    try {
+      ws.send(
+        JSON.stringify({ role: "extension", version: chrome.runtime.getManifest().version }),
+      );
+      await flushExtensionFailures(ws);
+    } catch {
+      await recordExtensionFailure(
+        "HANDSHAKE_SEND_FAILED",
+        "extension_connection",
+        "connect",
+        { retryable: true },
+      );
+    }
   };
 
   ws.onmessage = async (event) => {
@@ -386,6 +649,22 @@ function connect() {
     try {
       msg = JSON.parse(event.data);
     } catch {
+      await recordExtensionFailure("PROTOCOL_INVALID_FRAME", "protocol", "decode", {
+        retryable: false,
+      });
+      return;
+    }
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+      await recordExtensionFailure("PROTOCOL_INVALID_FRAME", "protocol", "decode", {
+        retryable: false,
+      });
+      return;
+    }
+    if (msg && msg.type === "failure_ack") {
+      await acknowledgeFailures(msg.event_ids);
+      await _failureQueueTail;
+      if (_failureQueue.length) scheduleFailureRetry(msg.retry_after_ms);
+      else clearFailureRetry();
       return;
     }
     const socket = ws;
@@ -394,9 +673,17 @@ function connect() {
       const result = await handleCommand(msg);
       payload = { id: msg.id, result: result ?? null };
     } catch (err) {
+      const code = safeFailureCode(err && err.bridge ? err.bridge.code : "INTERNAL");
+      const recordedFailureId = await recordExtensionFailure(code, msg.method, "command", {
+        retryable: ["TAB_GONE", "NAV_TIMEOUT", "SCOPE_CLOSING"].includes(code),
+      });
+      const wireError = err && err.bridge
+        ? { ...err.bridge }
+        : { code: "INTERNAL", message: String(err?.message || err) };
+      if (recordedFailureId) wireError.failure_id = recordedFailureId;
       payload = {
         id: msg.id,
-        error: err && err.bridge ? err.bridge : { code: "INTERNAL", message: String(err?.message || err) },
+        error: wireError,
       };
     }
     // 命令可能跑了很久，期间连接可能已经换掉；对着死 socket send 会抛。
@@ -405,13 +692,40 @@ function connect() {
         socket.send(JSON.stringify(payload));
       } catch (e) {
         console.warn("[Chrome Bridge] failed to deliver reply", e);
+        await recordExtensionFailure("REPLY_DELIVERY_FAILED", msg.method, "delivery", {
+          retryable: true,
+        });
       }
     } else {
       console.warn("[Chrome Bridge] dropped reply for", msg.method, "— socket closed");
+      await recordExtensionFailure("REPLY_DELIVERY_FAILED", msg.method, "delivery", {
+        retryable: true,
+      });
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    clearFailureRetry();
+    if (
+      _relayEverOpened &&
+      !_relayOutageRecorded &&
+      !event?.wasClean &&
+      event?.code !== 1000
+    ) {
+      _relayOutageRecorded = true;
+      void recordExtensionFailure(
+        "EXTENSION_DISCONNECTED",
+        "extension_connection",
+        "connect",
+        {
+          retryable: true,
+          websocket_close_code: Number.isInteger(event?.code) ? event.code : undefined,
+        },
+      );
+    }
+    // A clean relay shutdown is expected between tasks. Mark the outage episode
+    // handled so reconnect attempts do not fill diagnostics while Bridge is idle.
+    _relayOutageRecorded = true;
     // 指数退避 + 抖动：server 没起来时别每 3s 敲一次。
     const delay = Math.min(30000, _reconnectDelay) * (0.8 + Math.random() * 0.4);
     console.log(`[Chrome Bridge] disconnected, reconnecting in ${Math.round(delay)}ms`);
@@ -421,6 +735,12 @@ function connect() {
 
   ws.onerror = (e) => {
     console.error("[Chrome Bridge] WebSocket error", e);
+    if (_relayEverOpened && !_relayOutageRecorded) {
+      _relayOutageRecorded = true;
+      void recordExtensionFailure("RELAY_UNREACHABLE", "extension_connection", "connect", {
+        retryable: true,
+      });
+    }
   };
 }
 
@@ -510,9 +830,12 @@ async function restoreTabRoutes(tabId, released) {
       // Do not hold up a confirmed refusal while a replacement is opening.
       // Re-check after the entire current tail settles; successful replacement
       // wins, failed replacement leaves the name available for restoration.
-      restoreSessionRouteAfterLocks(tabId, key).catch((e) =>
-        console.warn("[Chrome Bridge] deferred session route restore failed", e),
-      );
+      restoreSessionRouteAfterLocks(tabId, key).catch((e) => {
+        console.warn("[Chrome Bridge] deferred session route restore failed", e);
+        void recordExtensionFailure("ROUTE_RESTORE_FAILED", "state", "lifecycle", {
+          retryable: true,
+        });
+      });
       continue;
     }
     if (!_sessions.has(key)) {
@@ -571,6 +894,9 @@ async function discardBridgeTab(tabId) {
       // This handler remains attached after the race below has returned, so a
       // delayed refusal is not silently lost.
       console.warn("[Chrome Bridge] tabs.remove refused:", error);
+      void recordExtensionFailure("TAB_CLOSE_FAILED", "browse_close", "lifecycle", {
+        retryable: true,
+      });
       releaseDrainingTab(scopeId, tabId);
       if (routesChanged) await restoreTabRoutes(tabId, releasedRoutes);
       return { ok: false, error };
@@ -627,7 +953,12 @@ chrome.tabs.onCreated.addListener((tab) => {
       });
     }
     if (scopeIsClosing(scopeId)) await discardBridgeTab(tab.id);
-  })().catch((e) => console.warn("[Chrome Bridge] child-tab tracking failed", e));
+  })().catch((e) => {
+    console.warn("[Chrome Bridge] child-tab tracking failed", e);
+    void recordExtensionFailure("TAB_TRACKING_FAILED", "window_lifecycle", "lifecycle", {
+      retryable: true,
+    });
+  });
 });
 
 // Chrome can swap a prerendered/Instant page into a new tab id. Transfer every
@@ -651,7 +982,12 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
     if (draining?.delete(removedTabId)) draining.add(addedTabId);
     await syncCspRule();
     await persistState();
-  })().catch((e) => console.warn("[Chrome Bridge] tab replacement tracking failed", e));
+  })().catch((e) => {
+    console.warn("[Chrome Bridge] tab replacement tracking failed", e);
+    void recordExtensionFailure("TAB_TRACKING_FAILED", "window_lifecycle", "lifecycle", {
+      retryable: true,
+    });
+  });
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
@@ -660,7 +996,12 @@ chrome.windows.onRemoved.addListener((windowId) => {
     if (_automationWindowId !== windowId) return;
     _automationWindowId = null;
     await persistState();
-  })().catch((e) => console.warn("[Chrome Bridge] window cleanup failed", e));
+  })().catch((e) => {
+    console.warn("[Chrome Bridge] window cleanup failed", e);
+    void recordExtensionFailure("WINDOW_STATE_FAILED", "window_lifecycle", "lifecycle", {
+      retryable: true,
+    });
+  });
 });
 
 // ───────────────────────── 命令路由 ─────────────────────────
@@ -1471,6 +1812,17 @@ async function cmdCloseOwnedTabs({ scope_id = LEGACY_SCOPE } = {}) {
   result.remaining = [..._bridgeTabs]
     .filter((tabId) => _tabScopes.get(tabId) === scopeId)
     .map(String);
+  // Accepted-but-unconfirmed removals are normal: the Python client waits up
+  // to its cleanup deadline. A delayed rejection logs TAB_CLOSE_FAILED in its
+  // own promise handler; only a definite refusal is a failure at this point.
+  if (result.refused.length) {
+    result.failure_id = await recordExtensionFailure(
+      "CLEANUP_INCOMPLETE",
+      "close_owned_tabs",
+      "command",
+      { retryable: true },
+    );
+  }
   return result;
 }
 

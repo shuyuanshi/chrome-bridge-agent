@@ -104,6 +104,7 @@ def test_import_bridge_client() -> None:
 
 
 def test_release_version_is_coordinated() -> None:
+    from bridge_client import CLIENT_VERSION  # noqa: PLC0415
     from bridge_server import SERVER_VERSION  # noqa: PLC0415
 
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -120,6 +121,7 @@ def test_release_version_is_coordinated() -> None:
         "project": project_match.group(1),
         "lock": lock_match.group(1),
         "manifest": manifest["version"],
+        "client": CLIENT_VERSION,
         "server": SERVER_VERSION,
         "skill": skill_match.group(1),
     }

@@ -16,10 +16,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+import bridge_server
 import pytest
+from bridge_failure_journal import FAILURE_LOG_ENV, failure_report
 from bridge_server import MAX_FRAME_BYTES, BridgeServer
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
@@ -191,7 +195,97 @@ def test_no_extension_returns_typed_error() -> None:
     assert reply["error"]["code"] == "EXTENSION_NOT_CONNECTED"
 
 
-def test_command_timeout_is_structured_and_honours_the_deadline() -> None:
+def test_no_extension_failure_is_persisted_and_linked_from_wire_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+
+    async def scenario() -> dict:
+        async with running_server() as (_server, port):
+            return await cli_call(port, {"method": "evaluate"})
+
+    reply = run(scenario())
+    report = failure_report(limit=10)
+    assert reply["error"]["failure_id"] == report["events"][0]["failure_id"]
+    assert report["matching_events"] == 1
+    assert report["events"][0]["component"] == "server"
+    assert report["events"][0]["code"] == "EXTENSION_NOT_CONNECTED"
+
+
+def test_extension_failure_batch_is_acknowledged_replayed_and_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal" / "failures.jsonl"
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(path))
+    canary = "PRIVATE_URL_https://example.test/?cookie=secret"
+    event = {
+        "event_id": "1234567890abcdef1234567890abcdef",
+        "occurred_at_ms": int(time.time() * 1000),
+        "component": "extension",
+        "code": "TAB_CLOSE_FAILED",
+        "operation": "browse_close",
+        "phase": "command",
+        "count": 1,
+        "retryable": True,
+        "extension_version": "2.2.0",
+        "message": canary,
+        "detail": {"url": canary},
+    }
+
+    second_event = {
+        **event,
+        "event_id": "abcdef1234567890abcdef1234567890",
+        "occurred_at_ms": event["occurred_at_ms"] + 1,
+    }
+    updated_second = {
+        **second_event,
+        "count": 3,
+        "last_seen_ms": event["occurred_at_ms"] + 2,
+    }
+    invalid_event = {**event, "event_id": "not-an-extension-id", "message": canary}
+
+    async def scenario() -> list[dict]:
+        async with running_server() as (_server, port):
+            ws = await connect(f"ws://localhost:{port}")
+            await ws.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            payload = json.dumps({"type": "failure_batch", "schema": 1, "events": [event]})
+            await ws.send(payload)
+            first = json.loads(await ws.recv())
+            await ws.send(payload)
+            replay = json.loads(await ws.recv())
+            await ws.send(
+                json.dumps({"type": "failure_batch", "schema": 1, "events": [second_event]})
+            )
+            second = json.loads(await ws.recv())
+            await ws.send(
+                json.dumps({"type": "failure_batch", "schema": 1, "events": [updated_second]})
+            )
+            updated = json.loads(await ws.recv())
+            await ws.send(
+                json.dumps({"type": "failure_batch", "schema": 1, "events": [invalid_event]})
+            )
+            invalid = json.loads(await ws.recv())
+            await ws.close()
+            return [first, replay, second, updated, invalid]
+
+    replies = run(scenario())
+    report = failure_report(limit=10)
+    assert replies[0]["event_ids"] == ["1234567890abcdef1234567890abcdef"]
+    assert replies[1]["event_ids"] == ["1234567890abcdef1234567890abcdef"]
+    assert replies[2]["event_ids"] == ["abcdef1234567890abcdef1234567890"]
+    assert replies[3]["event_ids"] == ["abcdef1234567890abcdef1234567890"]
+    assert replies[4]["event_ids"] == []
+    assert report["matching_events"] == 2
+    assert report["events"][0]["component"] == "extension"
+    assert report["events"][1]["count"] == 3
+    assert canary not in path.read_text(encoding="utf-8")
+
+
+def test_command_timeout_is_structured_and_honours_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+
     async def scenario() -> dict:
         async with (
             running_server() as (_server, port),
@@ -201,10 +295,16 @@ def test_command_timeout_is_structured_and_honours_the_deadline() -> None:
 
     reply = run(scenario())
     assert reply["error"]["code"] == "TIMEOUT"
+    assert reply["error"]["failure_id"]
     assert reply["error"]["detail"]["timeout"] == pytest.approx(1.0)  # floored at 1s
+    assert failure_report(code="TIMEOUT")["matching_events"] == 1
 
 
-def test_extension_disconnect_fails_inflight_commands() -> None:
+def test_extension_disconnect_fails_inflight_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+
     async def scenario() -> dict:
         async with (
             running_server() as (_server, port),
@@ -223,9 +323,15 @@ def test_extension_disconnect_fails_inflight_commands() -> None:
 
     reply = run(scenario())
     assert reply["error"]["code"] == "EXTENSION_NOT_CONNECTED"
+    assert reply["error"]["failure_id"]
+    assert failure_report(code="EXTENSION_NOT_CONNECTED")["matching_events"] == 1
 
 
-def test_extension_error_is_relayed_verbatim() -> None:
+def test_extension_error_is_relayed_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+
     async def scenario() -> dict:
         async with running_server() as (_server, port):
             ws = await connect(f"ws://localhost:{port}")
@@ -253,6 +359,266 @@ def test_extension_error_is_relayed_verbatim() -> None:
 
     reply = run(scenario())
     assert reply["error"]["code"] == "ELEMENT_NOT_FOUND"
+    assert reply["error"]["failure_id"]
+    assert failure_report(code="ELEMENT_NOT_FOUND")["matching_events"] == 1
+
+
+def test_forged_wire_failure_id_is_replaced_with_a_journal_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal" / "failures.jsonl"
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(path))
+    token_shaped_id = "a" * 64
+
+    async def scenario() -> dict:
+        async with running_server() as (_server, port):
+            ws = await connect(f"ws://localhost:{port}")
+            await ws.send(json.dumps({"role": "extension"}))
+
+            async def pump() -> None:
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "id": msg["id"],
+                                "error": {
+                                    "code": "ELEMENT_NOT_FOUND",
+                                    "message": "missing",
+                                    "failure_id": token_shaped_id,
+                                },
+                            }
+                        )
+                    )
+
+            task = asyncio.create_task(pump())
+            await asyncio.sleep(0.05)
+            try:
+                return await cli_call(port, {"method": "click_element"})
+            finally:
+                task.cancel()
+                await ws.close()
+
+    reply = run(scenario())
+    report = failure_report()
+    assert reply["error"]["failure_id"] == report["events"][0]["failure_id"]
+    assert reply["error"]["failure_id"] != token_shaped_id
+    assert token_shaped_id not in path.read_text(encoding="utf-8")
+
+
+def test_manual_reload_reconnect_is_acknowledged_without_a_failure_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+    monkeypatch.setattr(bridge_server, "MANUAL_RELOAD_RECONNECT_TIMEOUT", 1.0)
+
+    async def scenario() -> dict:
+        async with running_server() as (server, port):
+            first = await connect(f"ws://localhost:{port}")
+            await first.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+            call = asyncio.create_task(cli_call(port, {"method": "reload_self"}))
+            await first.recv()
+            reply = await call
+            await first.close()
+            await _settle(lambda: server._extension_ws is None)
+            second = await connect(f"ws://localhost:{port}")
+            await second.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+            assert server._reload_triggered is False
+            await asyncio.sleep(0.01)
+            await second.close()
+            return reply
+
+    reply = run(scenario())
+    assert reply["result"]["ok"] is True
+    assert failure_report()["matching_events"] == 0
+
+
+def test_manual_reload_without_reconnect_is_journaled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+    monkeypatch.setattr(bridge_server, "MANUAL_RELOAD_RECONNECT_TIMEOUT", 0.05)
+
+    async def scenario() -> dict:
+        async with running_server() as (server, port):
+            ext = await connect(f"ws://localhost:{port}")
+            await ext.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+            call = asyncio.create_task(cli_call(port, {"method": "reload_self"}))
+            await ext.recv()
+            reply = await call
+            # Simulate an extension that received reload_self but ignored it.
+            await asyncio.sleep(0.1)
+            await ext.close()
+            return reply
+
+    reply = run(scenario())
+    assert reply["result"]["ok"] is True
+    event = failure_report(code="RELOAD_RECONNECT_TIMEOUT")["events"][0]
+    assert event["extension_version"] == "2.2.0"
+
+
+def test_file_reload_while_disconnected_is_journaled_and_delivered_on_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+
+    async def scenario() -> dict:
+        async with running_server() as (server, port):
+            await server._reload_extension()
+            assert server._reload_pending is True
+            ext = await connect(f"ws://localhost:{port}")
+            await ext.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            command = json.loads(await asyncio.wait_for(ext.recv(), timeout=2))
+            await ext.close()
+            return command
+
+    command = run(scenario())
+    event = failure_report(code="EXTENSION_NOT_CONNECTED")["events"][0]
+    assert command["method"] == "reload_self"
+    assert event["operation"] == "reload_self"
+    assert event["phase"] == "route"
+
+
+def test_auto_reload_timeout_resets_expected_disconnect_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+    monkeypatch.setattr(bridge_server, "AUTO_RELOAD_RECONNECT_ATTEMPTS", 1)
+    monkeypatch.setattr(bridge_server, "AUTO_RELOAD_RECONNECT_INTERVAL", 0.01)
+
+    async def scenario() -> bool:
+        async with running_server() as (server, port):
+            ext = await connect(f"ws://localhost:{port}")
+            await ext.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+            await server._reload_extension()
+            triggered = server._reload_triggered
+            await ext.close()
+            return triggered
+
+    assert run(scenario()) is False
+    event = failure_report(code="RELOAD_RECONNECT_TIMEOUT")["events"][0]
+    assert event["extension_version"] == "2.2.0"
+
+
+def test_extension_failure_ingestion_is_rate_limited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+    server = BridgeServer(token=TOKEN)
+
+    assert server._extension_failure_budget(100) == 100
+    assert server._extension_failure_budget(1) == 0
+    report = failure_report(code="FAILURE_BATCH_RATE_LIMITED")
+    assert report["matching_events"] == 1
+
+
+def test_rate_limited_batch_falls_back_to_durable_command_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal" / "failures.jsonl"
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(path))
+    failure_id = "c" * 32
+
+    async def scenario() -> tuple[dict, dict, dict]:
+        async with running_server() as (server, port):
+            server._failure_ingest_count = 100
+            server._failure_ingest_window = time.monotonic()
+            ext = await connect(f"ws://localhost:{port}")
+            await ext.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+            client = asyncio.create_task(cli_call(port, {"method": "evaluate"}))
+            command = json.loads(await ext.recv())
+            event = {
+                "event_id": failure_id,
+                "code": "JS_ERROR",
+                "operation": "evaluate",
+                "phase": "command",
+                "extension_version": "2.2.0",
+            }
+            await ext.send(json.dumps({"type": "failure_batch", "schema": 1, "events": [event]}))
+            empty_ack = json.loads(await ext.recv())
+            await ext.send(
+                json.dumps(
+                    {
+                        "id": command["id"],
+                        "error": {
+                            "code": "JS_ERROR",
+                            "message": "private message is not journaled",
+                            "failure_id": failure_id,
+                        },
+                    }
+                )
+            )
+            fallback_ack = json.loads(await ext.recv())
+            reply = await client
+            await ext.close()
+            return empty_ack, fallback_ack, reply
+
+    empty_ack, fallback_ack, reply = run(scenario())
+    report = failure_report(code="JS_ERROR")
+    assert empty_ack["event_ids"] == []
+    assert fallback_ack["event_ids"] == [failure_id]
+    assert reply["error"]["failure_id"] == failure_id
+    assert report["matching_events"] == 1
+    assert report["events"][0]["failure_id"] == failure_id
+
+
+def test_rate_limited_cleanup_result_id_is_durable_before_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal" / "failures.jsonl"
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(path))
+    failure_id = "d" * 32
+
+    async def scenario() -> tuple[dict, dict, dict]:
+        async with running_server() as (server, port):
+            server._failure_ingest_count = 100
+            server._failure_ingest_window = time.monotonic()
+            ext = await connect(f"ws://localhost:{port}")
+            await ext.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+            client = asyncio.create_task(cli_call(port, {"method": "close_owned_tabs"}))
+            command = json.loads(await ext.recv())
+            event = {
+                "event_id": failure_id,
+                "code": "CLEANUP_INCOMPLETE",
+                "operation": "close_owned_tabs",
+                "phase": "command",
+                "extension_version": "2.2.0",
+            }
+            await ext.send(json.dumps({"type": "failure_batch", "schema": 1, "events": [event]}))
+            empty_ack = json.loads(await ext.recv())
+            await ext.send(
+                json.dumps(
+                    {
+                        "id": command["id"],
+                        "result": {
+                            "requested": 1,
+                            "confirmed": [],
+                            "pending": [],
+                            "refused": [],
+                            "remaining": ["1"],
+                            "failure_id": failure_id,
+                        },
+                    }
+                )
+            )
+            fallback_ack = json.loads(await ext.recv())
+            reply = await client
+            await ext.close()
+            return empty_ack, fallback_ack, reply
+
+    empty_ack, fallback_ack, reply = run(scenario())
+    report = failure_report(code="CLEANUP_INCOMPLETE")
+    assert empty_ack["event_ids"] == []
+    assert fallback_ack["event_ids"] == [failure_id]
+    assert reply["result"]["failure_id"] == failure_id
+    assert report["matching_events"] == 1
+    assert report["events"][0]["failure_id"] == failure_id
 
 
 def test_ping_server_reports_state() -> None:
@@ -356,6 +722,34 @@ def test_web_page_origin_is_refused() -> None:
     out = run(scenario())
     assert delivered == [], "a web-origin socket got a command through to the browser"
     assert out["close_code"] == 1008 or out["reply"]["error"]["code"] == "UNAUTHORIZED"
+
+
+def test_web_origin_rejection_burst_has_bounded_off_loop_journaling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+
+    async def scenario() -> dict:
+        async with running_server() as (_server, port):
+
+            async def rejected(index: int) -> None:
+                ws = await connect(
+                    f"ws://localhost:{port}",
+                    additional_headers={"Origin": f"https://evil{index}.example"},
+                )
+                with contextlib.suppress(Exception):
+                    await ws.recv()
+                with contextlib.suppress(Exception):
+                    await ws.close()
+
+            await asyncio.gather(*(rejected(index) for index in range(20)))
+            return await cli_call(port, {"method": "ping_server"})
+
+    health = run(scenario())
+    report = failure_report(code="UNAUTHORIZED")
+    assert health["result"]["server_version"] == "2.2.0"
+    assert report["matching_events"] == 1
+    assert report["events"][0]["phase"] == "origin"
 
 
 def test_extension_origin_is_allowed() -> None:

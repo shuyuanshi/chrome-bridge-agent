@@ -133,7 +133,7 @@ Version 2.0 intentionally breaks the old implicit full-profile cookie export.
 `page.get_cookies()` and `chrome-bridge cookies` now require either one domain
 or an explicit all-domain opt-in. Restart the relay and reload the unpacked
 extension after upgrading. `chrome-bridge status` should show both
-`server_version` and `extension_version` as `2.1.0`.
+`server_version` and `extension_version` as `2.2.0`.
 If an older extension left tracked tabs behind during the upgrade, run
 `chrome-bridge --scope legacy cleanup` once; ownership checks still prevent
 that command from closing ordinary user tabs.
@@ -177,7 +177,7 @@ uv run python scripts/bridge_server.py
 Output will look roughly like:
 
 ```
-INFO:chrome-bridge:Chrome Bridge server 2.1.0 listening on ws://localhost:9333
+INFO:chrome-bridge:Chrome Bridge server 2.2.0 listening on ws://localhost:9333
 INFO:chrome-bridge:auth enabled; token at /Users/you/.chrome-bridge-token
 INFO:chrome-bridge:waiting for the Chrome extension to connect...
 INFO:chrome-bridge:extension connected
@@ -195,7 +195,8 @@ first start; the Python client picks it up automatically. See
 
 ```bash
 python3 scripts/bridge_client.py status
-# {"extension_connected": true, "pending": 0, "server_version": "2.1.0"}
+# {"extension_connected": true, "extension_version": "2.2.0", "pending": 0,
+#  "server_version": "2.2.0"}
 
 python3 scripts/bridge_client.py eval 'document.title' --url https://example.com
 # "Example Domain"
@@ -205,6 +206,34 @@ If `extension_connected` is `false`, poll `status` for up to 35 seconds first.
 The MV3 worker reconnects with exponential backoff and normally recovers
 without touching Chrome. Only if it remains disconnected should you open
 `chrome://extensions` and click ↻ on the extension card.
+
+### Persistent failure journal
+
+Failures are automatically written as privacy-safe JSONL under
+`~/.local/state/chrome-bridge/failures.jsonl` (or the path in
+`CHROME_BRIDGE_FAILURE_LOG`). Every journal/lock file and the default or newly
+created parent directory are owner-only; an existing custom parent directory
+must be trusted. Retention is bounded by rotating 1 MiB files. Events contain
+typed codes, operations, phases, timings, and component
+versions—not URLs, selectors, JavaScript, form input, page content, cookies,
+tokens, bodies, or stack traces. Nothing is uploaded and no fix is applied
+automatically.
+
+The reader is deliberately offline, so it still works when the failure is that
+the relay or extension will not start:
+
+```bash
+chrome-bridge failures --limit 50
+chrome-bridge failures --component extension --code TAB_CLOSE_FAILED
+chrome-bridge failures --id <failure-id>
+```
+
+The extension keeps a bounded local queue while the relay is unavailable and
+flushes it after reconnect (at most 100 events or 64 KiB, expiring after seven
+days). Set `CHROME_BRIDGE_FAILURE_LOG=off` only when
+persistent diagnostics are not wanted. See
+[`references/failure-journal.md`](references/failure-journal.md) for the schema
+and maintenance workflow.
 
 ### Common pitfalls
 
@@ -380,7 +409,8 @@ page.close_owned_tabs()                        # this scope only
 Errors are typed (`ElementNotFoundError`, `TabGoneError`, `JSEvalError`,
 `StaleRefError`, `BridgeTimeoutError`, …), all subclassing `BridgeError`
 with a machine-readable `.code`, so retry logic doesn't have to grep
-message strings.
+message strings. A persisted error also carries `.failure_id`, which can be
+passed to `chrome-bridge failures --id <failure-id>` for correlation.
 
 ### CLI
 
@@ -468,8 +498,14 @@ To run the **integration tests** (requires the bridge server + extension
 + a live Chrome), drop the marker filter:
 
 ```bash
+CHROME_BRIDGE_FAILURE_LOG=/tmp/chrome-bridge-test-failures.jsonl chrome-bridge-server --no-watch
 uv run pytest
 ```
+
+Use a disposable journal path (or `off`) in the relay process: pytest disables
+client-side persistence, but it cannot change the environment of an already
+running relay, and intentional error-path tests must not enter the production
+journal.
 
 Integration tests auto-skip when the bridge isn't reachable — see
 [`references/integration-test-pattern.md`](references/integration-test-pattern.md).

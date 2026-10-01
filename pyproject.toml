@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chrome-bridge-agent"
-version = "2.1.0"
+version = "2.2.0"
 description = "Drive your real Chrome (with logins, cookies, SPA state) from Python or any agent."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,7 +42,7 @@ chrome-bridge-server = "bridge_server:main_cli"
 Homepage = "https://github.com/shuyuanshi/chrome-bridge-agent"
 Issues = "https://github.com/shuyuanshi/chrome-bridge-agent/issues"
 
-# scripts/ holds three flat modules, not a package — map them to the wheel root
+# scripts/ holds flat modules, not a package — map them to the wheel root
 # so `import bridge_client` works both installed and via sys.path.
 [tool.hatch.build.targets.wheel]
 only-include = ["scripts"]

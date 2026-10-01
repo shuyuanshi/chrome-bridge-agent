@@ -7,9 +7,14 @@ Implements the auto-skip pattern documented in
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 import pytest
+
+# Intentional error-path tests must never pollute the user's real journal.
+# Individual journal tests override this with a private temporary path.
+os.environ["CHROME_BRIDGE_FAILURE_LOG"] = "off"
 
 
 @lru_cache(maxsize=1)

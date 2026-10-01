@@ -3,7 +3,7 @@ name: chrome-bridge-agent
 description: Drive the user's real Chrome with existing logins, cookies, extensions, and SPA state. Use when the host's native browser cannot access the required signed-in Chrome profile, when the user explicitly requests Chrome Bridge, or for logged-in pages, multi-step SPAs, cookie-backed APIs, and sites that block headless browsers. Do not use for public-page research that does not need the user's Chrome state.
 license: MIT
 metadata:
-  version: "2.1.0"
+  version: "2.2.0"
   homepage: "https://github.com/shuyuanshi/chrome-bridge-agent"
 ---
 
@@ -118,13 +118,14 @@ Python script  ─►  bridge_client.BridgePage / Tab
 | `scripts/bridge_server.py` | WebSocket relay (port 9333 by default) |
 | `scripts/bridge_client.py` | Python client (`BridgePage`, `Tab`) + `chrome-bridge` CLI |
 | `scripts/bridge_auth.py` | Shared-token helpers |
+| `scripts/bridge_failure_journal.py` | Privacy-safe bounded failure persistence + offline reports |
 
 ## Preflight (do this before any browser command)
 
 ```bash
 chrome-bridge status
-# {"extension_connected": true, "extension_version": "2.1.0", "pending": 0,
-#  "server_version": "2.1.0"}
+# {"extension_connected": true, "extension_version": "2.2.0", "pending": 0,
+#  "server_version": "2.2.0"}
 ```
 
 If `extension_version` is missing or below the server version, Chrome is still
@@ -165,6 +166,31 @@ session-scoped verbs would quietly act on the shared managed tab.
   lives at `~/.chrome-bridge-token` (mode 0600) and is created by the server
   on first start; `CHROME_BRIDGE_TOKEN` overrides it.
 
+## Failure journal and log-driven improvement
+
+Chrome Bridge records failed RPCs, relay failures, and extension lifecycle
+failures in a bounded owner-only journal. It stores typed codes and fixed
+metadata only—never URLs, selectors, JavaScript, typed text, page content,
+cookies, tokens, request bodies, or stacks. The offline reader works even when
+Chrome and the relay do not:
+
+```bash
+chrome-bridge failures --limit 50
+chrome-bridge failures --code EXTENSION_NOT_CONNECTED
+chrome-bridge failures --id <failure-id>
+```
+
+When the user asks why the Bridge failed or asks to improve it from the logs,
+read this journal first. Separate direct evidence from inference, reproduce the
+dominant actionable signature with the smallest read-only case, and do not
+blindly retry an at-most-once action that may already have run. Fix the owning
+layer, add a regression test for that signature, run the relevant offline/live
+checks, and verify the reproduction succeeds without a new matching event.
+Passive capture never authorizes an automatic code change, retry, or external
+action, and the journal must not be cleared automatically. Read
+[`references/failure-journal.md`](references/failure-journal.md) when diagnosing
+or maintaining this mechanism.
+
 ## Shell one-liners (no .py file needed)
 
 ```bash
@@ -174,6 +200,7 @@ chrome-bridge text --url https://x.com/y # innerText, chunked
 chrome-bridge fetch https://internal/api/x --url https://internal --json
 chrome-bridge screenshot --url https://example.com --selector "#chart" --out chart.png
 chrome-bridge list-tabs
+chrome-bridge failures --limit 50          # works with relay/Chrome offline
 chrome-bridge reload                     # after editing extension/
 
 # Only when continuity across processes is required:
@@ -322,7 +349,9 @@ except TabGoneError:
 `BridgeError` is the base; subclasses are `BridgeConnectionError`,
 `BridgeAuthError`, `ExtensionNotConnectedError`, `BridgeTimeoutError`,
 `ElementNotFoundError`, `TabGoneError`, `JSEvalError` (`.detail["stack"]`),
-`StaleRefError`, `NavigationTimeoutError`. Every one carries `.code`.
+`StaleRefError`, `NavigationTimeoutError`. Every one carries `.code`;
+persisted failures also carry `.failure_id` for
+`chrome-bridge failures --id <failure-id>`.
 
 ## Gotchas
 

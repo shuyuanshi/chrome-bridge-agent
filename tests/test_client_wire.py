@@ -25,6 +25,7 @@ from bridge_client import (
     StaleRefError,
     TabGoneError,
 )
+from bridge_failure_journal import FAILURE_LOG_ENV, failure_report
 from websockets.sync.server import serve
 
 
@@ -83,6 +84,33 @@ class FakeRelay:
 
 def page_for(relay: FakeRelay, **kwargs: Any) -> BridgePage:
     return BridgePage(relay.url, token="tok", **kwargs)
+
+
+def test_failed_rpc_is_journaled_once_without_params_message_or_detail(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal" / "failures.jsonl"
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(path))
+    canary = "PRIVATE_CANARY_https://example.test/?token=secret"
+    response = {
+        "error": {
+            "code": "JS_ERROR",
+            "message": canary,
+            "detail": {"stack": canary, "url": canary},
+            "failure_id": "a" * 64,
+        }
+    }
+
+    with FakeRelay(lambda _msg: response) as relay, pytest.raises(JSEvalError) as raised:
+        page_for(relay).evaluate(canary)
+
+    report = failure_report(limit=10)
+    assert report["matching_events"] == 1
+    assert report["events"][0]["code"] == "JS_ERROR"
+    assert report["events"][0]["operation"] == "evaluate"
+    assert raised.value.failure_id == report["events"][0]["failure_id"]
+    assert raised.value.failure_id != "a" * 64
+    assert canary not in path.read_text(encoding="utf-8")
 
 
 # ─────────────────── params that used to be dropped ───────────────────
@@ -849,8 +877,12 @@ def test_cli_anonymous_url_ignores_persistent_env_scope_for_cleanup(
         assert all(frame["scope_id"] != persistent_scope for frame in cleanup_frames)
 
 
-def test_cli_cleans_temp_scope_when_command_raises_a_non_bridge_error() -> None:
+def test_cli_cleans_temp_scope_when_command_raises_a_non_bridge_error(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from bridge_client import main
+
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
 
     def responder(msg: dict) -> dict:
         if msg["method"] == "browse_open":
@@ -888,6 +920,8 @@ def test_cli_cleans_temp_scope_when_command_raises_a_non_bridge_error() -> None:
     methods = [frame["method"] for frame in relay.frames]
     assert "browse_close" in methods
     assert "close_owned_tabs" in methods
+    event = failure_report(code="INTERNAL_CLI")["events"][0]
+    assert event["operation"] == "page_fetch"
 
 
 def test_cli_returns_nonzero_when_one_shot_cleanup_fails(

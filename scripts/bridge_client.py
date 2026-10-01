@@ -45,9 +45,31 @@ from typing import Any
 
 import websockets.sync.client as ws_client
 from bridge_auth import read_token
+from bridge_failure_journal import (
+    FailureJournalError,
+    failure_report,
+    is_valid_failure_id,
+    record_failure,
+)
 from websockets.exceptions import WebSocketException
 
 BRIDGE_URL = "ws://localhost:9333"
+CLIENT_VERSION = "2.2.0"
+
+_CLI_DIAGNOSTIC_OPERATIONS = {
+    "eval": "evaluate",
+    "text": "get_text",
+    "snapshot": "snapshot",
+    "fetch": "page_fetch",
+    "screenshot": "screenshot",
+    "cookies": "get_cookies",
+    "list-tabs": "list_tabs",
+    "list-sessions": "list_sessions",
+    "cleanup": "close_owned_tabs",
+    "close": "browse_close",
+    "reload": "reload_self",
+    "status": "ping_server",
+}
 
 DEFAULT_TIMEOUT = 90.0
 # The server must time out first so the caller gets a structured TIMEOUT error
@@ -72,11 +94,19 @@ class BridgeError(Exception):
 
     code = "BRIDGE_ERROR"
 
-    def __init__(self, message: str, *, code: str | None = None, detail: Any = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        detail: Any = None,
+        failure_id: str | None = None,
+    ) -> None:
         super().__init__(message)
         if code:
             self.code = code
         self.detail = detail
+        self.failure_id = failure_id
 
 
 class BridgeConnectionError(BridgeError):
@@ -199,9 +229,15 @@ def _raise_for(error: Any) -> None:
         code = str(error.get("code") or "BRIDGE_ERROR")
         message = str(error.get("message") or error)
         detail = error.get("detail")
+        failure_id = error.get("failure_id")
     else:  # pre-1.1 servers/extensions sent a bare string
-        code, message, detail = "BRIDGE_ERROR", str(error), None
-    raise _ERROR_TYPES.get(code, BridgeError)(message, code=code, detail=detail)
+        code, message, detail, failure_id = "BRIDGE_ERROR", str(error), None, None
+    raise _ERROR_TYPES.get(code, BridgeError)(
+        message,
+        code=code,
+        detail=detail,
+        failure_id=failure_id if is_valid_failure_id(failure_id) else None,
+    )
 
 
 class BridgePage:
@@ -278,7 +314,26 @@ class BridgePage:
             payload["params"] = merged
 
         started = time.monotonic()
-        resp = self._roundtrip(payload, deadline)
+        try:
+            resp = self._roundtrip(payload, deadline)
+        except BridgeError as error:
+            failure_id = record_failure(
+                component="client",
+                code=error.code,
+                operation=method,
+                phase="transport",
+                exception=error,
+                duration_ms=(time.monotonic() - started) * 1000,
+                scope_id=self._scope_id,
+                client_version=CLIENT_VERSION,
+                retryable=isinstance(
+                    error,
+                    (BridgeConnectionError, BridgeTimeoutError, ExtensionNotConnectedError),
+                ),
+            )
+            if failure_id:
+                error.failure_id = failure_id
+            raise
         if _LOG.isEnabledFor(logging.DEBUG):
             _LOG.debug(
                 "%s(%s) -> %s in %.2fs",
@@ -289,7 +344,27 @@ class BridgePage:
             )
 
         if resp.get("error"):
-            _raise_for(resp["error"])
+            wire_error = resp["error"]
+            already_recorded = isinstance(wire_error, dict) and is_valid_failure_id(
+                wire_error.get("failure_id")
+            )
+            if not already_recorded:
+                if isinstance(wire_error, dict):
+                    code = str(wire_error.get("code") or "BRIDGE_ERROR")
+                else:
+                    code = "BRIDGE_ERROR"
+                failure_id = record_failure(
+                    component="client",
+                    code=code,
+                    operation=method,
+                    phase="response",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    scope_id=self._scope_id,
+                    client_version=CLIENT_VERSION,
+                )
+                if failure_id and isinstance(wire_error, dict):
+                    wire_error = {**wire_error, "failure_id": failure_id}
+            _raise_for(wire_error)
         return resp.get("result")
 
     def _roundtrip(self, payload: dict[str, Any], deadline: float) -> dict:
@@ -420,11 +495,26 @@ class BridgePage:
         ]
         if result.get("refused") or (wait and result["remaining"]):
             count = len(result["remaining"]) or len(result.get("refused") or [])
-            raise BridgeError(
+            error = BridgeError(
                 f"Chrome left {count} bridge-owned tab(s) open after cleanup",
                 code="TAB_CLEANUP_FAILED",
                 detail=result,
             )
+            existing_failure_id = result.get("failure_id")
+            error.failure_id = (
+                existing_failure_id
+                if is_valid_failure_id(existing_failure_id)
+                else record_failure(
+                    component="client",
+                    code=error.code,
+                    operation="close_owned_tabs",
+                    phase="cleanup_result",
+                    exception=error,
+                    scope_id=self._scope_id,
+                    client_version=CLIENT_VERSION,
+                )
+            )
+            raise error
         return result
 
     # ─── navigation ─────────────────────────────────────────────
@@ -639,11 +729,21 @@ class BridgePage:
             res["body"] = self._drain_buffer(res["length"])
             res.pop("buffered", None)
         if raise_for_status and not res.get("ok"):
-            raise BridgeError(
+            error = BridgeError(
                 f"HTTP {res.get('status')} for {url}",
                 code="HTTP_ERROR",
                 detail={"status": res.get("status"), "body": (res.get("body") or "")[:2000]},
             )
+            error.failure_id = record_failure(
+                component="client",
+                code=error.code,
+                operation="page_fetch",
+                phase="http_status",
+                exception=error,
+                scope_id=self._scope_id,
+                client_version=CLIENT_VERSION,
+            )
+            raise error
         return res
 
     def fetch_json(self, url: str, **kwargs: Any) -> Any:
@@ -913,7 +1013,10 @@ class BridgePage:
         try:
             return self._call("ping_server", timeout=5) or {}
         except BridgeError as e:
-            return {"error": e.code, "message": str(e)}
+            result = {"error": e.code, "message": str(e)}
+            if e.failure_id:
+                result["failure_id"] = e.failure_id
+            return result
 
     def is_server_running(self) -> bool:
         try:
@@ -1088,10 +1191,38 @@ def main(argv: list[str] | None = None) -> int:
     add("reload", "reload the extension (after editing extension/)")
     add("cleanup", "close every bridge-owned tab in this scope")
 
+    p_failures = add("failures", "read the local privacy-safe failure journal")
+    p_failures.add_argument("--limit", type=int, default=50, help="return at most N events")
+    p_failures.add_argument("--code", help="filter by typed failure code")
+    p_failures.add_argument("--component", help="filter by client/server/extension/cli")
+    p_failures.add_argument("--id", dest="failure_id", help="look up one failure id")
+
     p_close = add("close", "close a named session or tab id")
     p_close.add_argument("target")
 
     args = parser.parse_args(argv)
+    if args.cmd == "failures":
+        try:
+            report = failure_report(
+                limit=args.limit,
+                code=args.code,
+                component=args.component,
+                failure_id=args.failure_id,
+            )
+        except FailureJournalError as error:
+            print(
+                json.dumps(
+                    {
+                        "error": "FAILURE_LOG_READ_FAILED",
+                        "exception_type": type(error).__name__,
+                    }
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
     bridge_url = getattr(args, "bridge_url", BRIDGE_URL)
     open_url = getattr(args, "url", None)
     session = getattr(args, "session", None)
@@ -1199,7 +1330,27 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_error = e
 
     if command_error is not None:
+        diagnostic_operation = _CLI_DIAGNOSTIC_OPERATIONS.get(args.cmd, "unknown")
+        if isinstance(command_error, BridgeError) and not command_error.failure_id:
+            command_error.failure_id = record_failure(
+                component="cli",
+                code=command_error.code,
+                operation=diagnostic_operation,
+                phase="dispatch",
+                exception=command_error,
+                client_version=CLIENT_VERSION,
+                scope_id=page.scope_id,
+            )
         if not isinstance(command_error, BridgeError):
+            record_failure(
+                component="cli",
+                code="INTERNAL_CLI",
+                operation=diagnostic_operation,
+                phase="dispatch",
+                exception=command_error,
+                client_version=CLIENT_VERSION,
+                scope_id=page.scope_id,
+            )
             if cleanup_error is not None:
                 _LOG.warning(
                     "cleanup also failed after %s: %s",
@@ -1212,23 +1363,28 @@ def main(argv: list[str] | None = None) -> int:
             "message": str(command_error),
             "detail": command_error.detail,
         }
+        if command_error.failure_id:
+            payload["failure_id"] = command_error.failure_id
         if cleanup_error is not None:
             payload["cleanup_error"] = {
                 "code": cleanup_error.code,
                 "message": str(cleanup_error),
                 "detail": cleanup_error.detail,
             }
+            if cleanup_error.failure_id:
+                payload["cleanup_error"]["failure_id"] = cleanup_error.failure_id
         print(json.dumps(payload), file=sys.stderr)
         return 1
     if cleanup_error is not None:
+        cleanup_payload = {
+            "error": cleanup_error.code,
+            "message": str(cleanup_error),
+            "detail": cleanup_error.detail,
+        }
+        if cleanup_error.failure_id:
+            cleanup_payload["failure_id"] = cleanup_error.failure_id
         print(
-            json.dumps(
-                {
-                    "error": cleanup_error.code,
-                    "message": str(cleanup_error),
-                    "detail": cleanup_error.detail,
-                }
-            ),
+            json.dumps(cleanup_payload),
             file=sys.stderr,
         )
         return 1
