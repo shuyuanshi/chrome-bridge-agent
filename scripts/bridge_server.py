@@ -92,7 +92,10 @@ class BridgeServer:
         self._token = token
         self._failure_ingest_window = time.monotonic()
         self._failure_ingest_count = 0
-        self._failure_rate_notice_at = 0.0
+        # A freshly booted host can have a monotonic clock below 60 seconds.
+        # Start at negative infinity so the first rejected batch is always
+        # journaled; later notices remain limited to one per minute.
+        self._failure_rate_notice_at = float("-inf")
         self._accepted_failure_ids: set[str] = set()
         self._accepted_failure_order: deque[str] = deque()
         self._reload_generation = 0
@@ -563,7 +566,7 @@ class BridgeServer:
         except Exception as e:
             # The extension vanished between the liveness check and the send.
             self._pending.pop(msg_id, None)
-            if method == "reload_self":
+            if method == "reload_self" and reload_generation == self._reload_generation:
                 self._reload_triggered = False
             logger.warning("%s: send failed: %s", method, e)
             await ws.send(
@@ -721,6 +724,8 @@ class BridgeServer:
             return
 
         self._reload_triggered = True
+        self._reload_generation += 1
+        generation = self._reload_generation
         extension_version = self._extension_version
         logger.info("triggering extension reload...")
         msg = {"method": "reload_self", "id": str(uuid.uuid4())}
@@ -743,11 +748,15 @@ class BridgeServer:
 
         for _ in range(AUTO_RELOAD_RECONNECT_ATTEMPTS):
             await asyncio.sleep(AUTO_RELOAD_RECONNECT_INTERVAL)
+            if generation != self._reload_generation:
+                return
             if self._extension_ws is None:
                 continue
             if not self._reload_triggered:
                 logger.info("extension reloaded and reconnected")
                 return
+        if generation != self._reload_generation or not self._reload_triggered:
+            return
         self._reload_triggered = False
         logger.warning("extension did not reconnect within 15s after reload")
         record_failure(

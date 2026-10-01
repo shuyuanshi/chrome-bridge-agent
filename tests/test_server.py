@@ -504,10 +504,142 @@ def test_auto_reload_timeout_resets_expected_disconnect_state(
     assert event["extension_version"] == "2.2.0"
 
 
+def test_older_auto_reload_cannot_clear_newer_manual_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+    monkeypatch.setattr(bridge_server, "AUTO_RELOAD_RECONNECT_ATTEMPTS", 1)
+    monkeypatch.setattr(bridge_server, "AUTO_RELOAD_RECONNECT_INTERVAL", 101.0)
+    monkeypatch.setattr(bridge_server, "MANUAL_RELOAD_RECONNECT_TIMEOUT", 102.0)
+
+    async def scenario() -> tuple[int, int, bool]:
+        auto_gate = asyncio.Event()
+        manual_gate = asyncio.Event()
+        real_sleep = asyncio.sleep
+
+        async def controlled_sleep(delay: float) -> None:
+            if delay == 101.0:
+                await auto_gate.wait()
+            elif delay == 102.0:
+                await manual_gate.wait()
+            else:
+                await real_sleep(delay)
+
+        monkeypatch.setattr(bridge_server.asyncio, "sleep", controlled_sleep)
+        async with running_server() as (server, port):
+            manual_watchdog_done = asyncio.Event()
+            original_watchdog = server._manual_reload_watchdog
+
+            async def observed_watchdog(generation: int, extension_version: str | None) -> None:
+                try:
+                    await original_watchdog(generation, extension_version)
+                finally:
+                    manual_watchdog_done.set()
+
+            monkeypatch.setattr(server, "_manual_reload_watchdog", observed_watchdog)
+            ext = await connect(f"ws://localhost:{port}")
+            await ext.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+
+            auto_reload = asyncio.create_task(server._reload_extension())
+            assert json.loads(await ext.recv())["method"] == "reload_self"
+            auto_generation = server._reload_generation
+
+            manual_reload = asyncio.create_task(cli_call(port, {"method": "reload_self"}))
+            assert json.loads(await ext.recv())["method"] == "reload_self"
+            assert (await manual_reload)["result"]["ok"] is True
+            manual_generation = server._reload_generation
+
+            auto_gate.set()
+            await auto_reload
+            newer_reload_still_expected = server._reload_triggered
+            manual_gate.set()
+            await asyncio.wait_for(manual_watchdog_done.wait(), timeout=1)
+            await ext.close()
+            return auto_generation, manual_generation, newer_reload_still_expected
+
+    auto_generation, manual_generation, newer_reload_still_expected = run(scenario())
+    assert manual_generation > auto_generation
+    assert newer_reload_still_expected is True
+    assert failure_report(code="RELOAD_RECONNECT_TIMEOUT")["matching_events"] == 1
+
+
+def test_older_manual_watchdog_cannot_clear_newer_auto_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+    monkeypatch.setattr(bridge_server, "MANUAL_RELOAD_RECONNECT_TIMEOUT", 101.0)
+    monkeypatch.setattr(bridge_server, "AUTO_RELOAD_RECONNECT_ATTEMPTS", 1)
+    monkeypatch.setattr(bridge_server, "AUTO_RELOAD_RECONNECT_INTERVAL", 102.0)
+
+    async def scenario() -> tuple[int, int, bool, int]:
+        manual_gate = asyncio.Event()
+        auto_gate = asyncio.Event()
+        real_sleep = asyncio.sleep
+
+        async def controlled_sleep(delay: float) -> None:
+            if delay == 101.0:
+                await manual_gate.wait()
+            elif delay == 102.0:
+                await auto_gate.wait()
+            else:
+                await real_sleep(delay)
+
+        monkeypatch.setattr(bridge_server.asyncio, "sleep", controlled_sleep)
+        async with running_server() as (server, port):
+            manual_watchdog_done = asyncio.Event()
+            original_watchdog = server._manual_reload_watchdog
+
+            async def observed_watchdog(generation: int, extension_version: str | None) -> None:
+                try:
+                    await original_watchdog(generation, extension_version)
+                finally:
+                    manual_watchdog_done.set()
+
+            monkeypatch.setattr(server, "_manual_reload_watchdog", observed_watchdog)
+            ext = await connect(f"ws://localhost:{port}")
+            await ext.send(json.dumps({"role": "extension", "version": "2.2.0"}))
+            await _settle(lambda: server._extension_ws is not None)
+
+            manual_reload = asyncio.create_task(cli_call(port, {"method": "reload_self"}))
+            assert json.loads(await ext.recv())["method"] == "reload_self"
+            assert (await manual_reload)["result"]["ok"] is True
+            manual_generation = server._reload_generation
+
+            auto_reload = asyncio.create_task(server._reload_extension())
+            assert json.loads(await ext.recv())["method"] == "reload_self"
+            auto_generation = server._reload_generation
+
+            manual_gate.set()
+            await asyncio.wait_for(manual_watchdog_done.wait(), timeout=1)
+            newer_reload_still_expected = server._reload_triggered
+            early_timeouts = failure_report(code="RELOAD_RECONNECT_TIMEOUT")["matching_events"]
+            auto_gate.set()
+            await auto_reload
+            await ext.close()
+            return (
+                manual_generation,
+                auto_generation,
+                newer_reload_still_expected,
+                early_timeouts,
+            )
+
+    manual_generation, auto_generation, newer_reload_still_expected, early_timeouts = run(
+        scenario()
+    )
+    assert auto_generation > manual_generation
+    assert newer_reload_still_expected is True
+    assert early_timeouts == 0
+    assert failure_report(code="RELOAD_RECONNECT_TIMEOUT")["matching_events"] == 1
+
+
 def test_extension_failure_ingestion_is_rate_limited(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(FAILURE_LOG_ENV, str(tmp_path / "journal" / "failures.jsonl"))
+    # GitHub runners may execute this within their first minute of uptime.
+    # The first rejection must be recorded even when monotonic() is below 60.
+    monkeypatch.setattr(bridge_server.time, "monotonic", lambda: 10.0)
     server = BridgeServer(token=TOKEN)
 
     assert server._extension_failure_budget(100) == 100
