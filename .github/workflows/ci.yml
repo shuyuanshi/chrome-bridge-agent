@@ -60,6 +60,9 @@ jobs:
         uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
+          # Every matrix entry restores the shared artifact cache. Let the
+          # lint job be the sole writer so parallel post-steps do not race.
+          save-cache: false
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -83,6 +86,7 @@ jobs:
         uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
+          save-cache: false
 
       - name: Validate SKILL.md against agentskills.io spec
         run: |
