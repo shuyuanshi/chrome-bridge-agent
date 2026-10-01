@@ -25,10 +25,87 @@ let _reconnectTimer = null;
 // Chrome 真实 tab id，即使 SW 重启也能 chrome.tabs.get 拿回来；
 // 命名 session 与 CSP 白名单存 chrome.storage.session。
 
-let _managedTabId = null;          // navigate / evaluate 默认用的后台标签页
-const _sessions = new Map();       // name -> tabId
+const LEGACY_SCOPE = "legacy";
+const SESSION_KEY_SEPARATOR = "\u001f";
+
+// Every client/run gets its own routing namespace. The dedicated automation
+// window is shared, but managed tabs, named sessions, and cleanup ownership
+// never are. Old clients that do not send scope_id continue in LEGACY_SCOPE.
+const _managedTabs = new Map();    // scopeId -> tabId
+const _sessions = new Map();       // `${scopeId}<US>${name}` -> tabId
 const _bridgeTabs = new Set();     // 由 bridge 创建的 tab id（CSP 规则作用域）
+const _tabScopes = new Map();      // tabId -> scopeId
+let _automationWindowId = null;    // minimized, unfocused same-profile window
+let _automationWindowTail = Promise.resolve();
+const _closingScopes = new Set();
+const _scopeActivities = new Map(); // scopeId -> Set<Promise<void>> for opens/creates
+const _drainingTabs = new Map();   // scopeId -> Set<tabId> accepted for delayed close
 let _persistStateTail = Promise.resolve();
+
+function normalizeScope(value) {
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, 128) : LEGACY_SCOPE;
+}
+
+function sessionKey(scopeId, name) {
+  return `${normalizeScope(scopeId)}${SESSION_KEY_SEPARATOR}${name}`;
+}
+
+function parseSessionKey(key) {
+  const split = key.indexOf(SESSION_KEY_SEPARATOR);
+  return split < 0
+    ? { scope_id: LEGACY_SCOPE, name: key }
+    : { scope_id: key.slice(0, split), name: key.slice(split + 1) };
+}
+
+function withAutomationWindowLock(fn) {
+  const run = _automationWindowTail.then(fn);
+  _automationWindowTail = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+function scopeIsClosing(scopeId) {
+  return _closingScopes.has(scopeId) || (_drainingTabs.get(scopeId)?.size || 0) > 0;
+}
+
+function beginScopeActivity(scopeId) {
+  let release;
+  const done = new Promise((resolve) => {
+    release = resolve;
+  });
+  const active = _scopeActivities.get(scopeId) || new Set();
+  active.add(done);
+  _scopeActivities.set(scopeId, active);
+  return () => {
+    active.delete(done);
+    if (!active.size) _scopeActivities.delete(scopeId);
+    release();
+  };
+}
+
+async function waitForScopeActivities(scopeId) {
+  for (;;) {
+    const active = [...(_scopeActivities.get(scopeId) || [])];
+    if (!active.length) return;
+    await Promise.allSettled(active);
+  }
+}
+
+function markDrainingTab(scopeId, tabId) {
+  const draining = _drainingTabs.get(scopeId) || new Set();
+  draining.add(tabId);
+  _drainingTabs.set(scopeId, draining);
+}
+
+function releaseDrainingTab(scopeId, tabId) {
+  if (!scopeId) return;
+  const draining = _drainingTabs.get(scopeId);
+  if (!draining) return;
+  draining.delete(tabId);
+  if (!draining.size) _drainingTabs.delete(scopeId);
+}
 
 function persistState() {
   const write = _persistStateTail.then(async () => {
@@ -37,9 +114,15 @@ function persistState() {
       // cannot be overwritten by an older write that happens to finish last.
       await chrome.storage.session.set({
         state: {
-          managedTabId: _managedTabId,
-          sessions: [..._sessions.entries()],
+          schemaVersion: 2,
+          managedTabs: [..._managedTabs.entries()],
+          sessions: [..._sessions.entries()].map(([key, tabId]) => {
+            const { scope_id, name } = parseSessionKey(key);
+            return [scope_id, name, tabId];
+          }),
           bridgeTabs: [..._bridgeTabs],
+          tabScopes: [..._tabScopes.entries()],
+          automationWindowId: _automationWindowId,
         },
       });
     } catch (e) {
@@ -123,9 +206,34 @@ const _hydrated = (async () => {
   try {
     const { state } = await chrome.storage.session.get("state");
     if (!state) return;
-    _managedTabId = state.managedTabId ?? null;
-    for (const [name, id] of state.sessions || []) _sessions.set(name, id);
+    if (Array.isArray(state.managedTabs)) {
+      for (const [scopeId, id] of state.managedTabs) {
+        _managedTabs.set(normalizeScope(scopeId), id);
+      }
+    } else if (state.managedTabId != null) {
+      // v2.0 migration: the one shared managed tab belongs to legacy clients.
+      _managedTabs.set(LEGACY_SCOPE, state.managedTabId);
+    }
+    for (const entry of state.sessions || []) {
+      if (entry.length >= 3) {
+        const [scopeId, name, id] = entry;
+        _sessions.set(sessionKey(scopeId, name), id);
+      } else {
+        const [name, id] = entry;
+        _sessions.set(sessionKey(LEGACY_SCOPE, name), id);
+      }
+    }
     for (const id of state.bridgeTabs || []) _bridgeTabs.add(id);
+    if (Array.isArray(state.tabScopes)) {
+      for (const [id, scopeId] of state.tabScopes) {
+        _tabScopes.set(Number(id), normalizeScope(scopeId));
+      }
+    }
+    // Tabs persisted by v2.0 predate ownership scopes.
+    for (const id of _bridgeTabs) {
+      if (!_tabScopes.has(id)) _tabScopes.set(id, LEGACY_SCOPE);
+    }
+    _automationWindowId = state.automationWindowId ?? null;
     await syncCspRule();
   } catch (e) {
     console.warn("[Chrome Bridge] state hydrate failed", e);
@@ -327,15 +435,19 @@ async function forgetTab(tabId) {
   // The removal event can be what wakes the service worker, in which case the
   // maps are still empty — without this the cleanup silently does nothing.
   await _hydrated;
+  const scopeId = _tabScopes.get(tabId);
   let dirty = false;
   if (_bridgeTabs.delete(tabId)) dirty = true;
-  if (_managedTabId === tabId) {
-    _managedTabId = null;
-    dirty = true;
-  }
-  for (const [name, id] of _sessions.entries()) {
+  if (_tabScopes.delete(tabId)) dirty = true;
+  for (const [scopeId, id] of _managedTabs.entries()) {
     if (id === tabId) {
-      _sessions.delete(name);
+      _managedTabs.delete(scopeId);
+      dirty = true;
+    }
+  }
+  for (const [key, id] of _sessions.entries()) {
+    if (id === tabId) {
+      _sessions.delete(key);
       dirty = true;
     }
   }
@@ -343,38 +455,41 @@ async function forgetTab(tabId) {
     await syncCspRule();
     await persistState();
   }
+  releaseDrainingTab(scopeId, tabId);
 }
 
 /** Stop routing new work to a tab whose close has been requested. */
 function releaseTabRoutes(tabId) {
-  const released = { managed: false, sessions: [] };
-  if (_managedTabId === tabId) {
-    _managedTabId = null;
-    released.managed = true;
-  }
-  for (const [name, id] of _sessions.entries()) {
+  const released = { managedScopes: [], sessions: [] };
+  for (const [scopeId, id] of _managedTabs.entries()) {
     if (id === tabId) {
-      _sessions.delete(name);
-      released.sessions.push(name);
+      _managedTabs.delete(scopeId);
+      released.managedScopes.push(scopeId);
+    }
+  }
+  for (const [key, id] of _sessions.entries()) {
+    if (id === tabId) {
+      _sessions.delete(key);
+      released.sessions.push(key);
     }
   }
   return released;
 }
 
-async function restoreSessionRouteAfterLocks(tabId, name) {
+async function restoreSessionRouteAfterLocks(tabId, key) {
   for (;;) {
-    const pending = _sessionOpenLocks.get(name);
+    const pending = _sessionOpenLocks.get(key);
     if (pending) {
       await pending;
       continue;
     }
-    if (_sessions.has(name)) return;
+    if (_sessions.has(key)) return;
     const existing = await chrome.tabs.get(tabId).catch(() => null);
     if (!existing) return;
     // tabs.get yielded; a new opener may have claimed the lock meanwhile.
-    if (_sessionOpenLocks.has(name)) continue;
-    if (_sessions.has(name)) return;
-    _sessions.set(name, tabId);
+    if (_sessionOpenLocks.has(key)) continue;
+    if (_sessions.has(key)) return;
+    _sessions.set(key, tabId);
     await persistState();
     return;
   }
@@ -384,22 +499,24 @@ async function restoreTabRoutes(tabId, released) {
   // The refusal handler just confirmed the tab is live. Deferred names recheck
   // existence after their locks settle; immediate routes can be restored now.
   let dirty = false;
-  if (released.managed && _managedTabId === null) {
-    _managedTabId = tabId;
-    dirty = true;
+  for (const scopeId of released.managedScopes) {
+    if (!_managedTabs.has(scopeId)) {
+      _managedTabs.set(scopeId, tabId);
+      dirty = true;
+    }
   }
-  for (const name of released.sessions) {
-    if (_sessionOpenLocks.has(name)) {
+  for (const key of released.sessions) {
+    if (_sessionOpenLocks.has(key)) {
       // Do not hold up a confirmed refusal while a replacement is opening.
       // Re-check after the entire current tail settles; successful replacement
       // wins, failed replacement leaves the name available for restoration.
-      restoreSessionRouteAfterLocks(tabId, name).catch((e) =>
+      restoreSessionRouteAfterLocks(tabId, key).catch((e) =>
         console.warn("[Chrome Bridge] deferred session route restore failed", e),
       );
       continue;
     }
-    if (!_sessions.has(name)) {
-      _sessions.set(name, tabId);
+    if (!_sessions.has(key)) {
+      _sessions.set(key, tabId);
       dirty = true;
     }
   }
@@ -412,13 +529,30 @@ async function restoreTabRoutes(tabId, released) {
  * cleanup; a refused removal deliberately leaves the live tab tracked.
  */
 async function discardBridgeTab(tabId) {
+  const scopeId = _tabScopes.get(tabId);
   const existing = await chrome.tabs.get(tabId).catch(() => null);
   if (!existing) {
     await forgetTab(tabId);
     return { ok: true, confirmed: true };
   }
 
-  let releasedRoutes = { managed: false, sessions: [] };
+  // Removing Chrome's last tab also closes its window. A sibling-count check
+  // is racy (the user can close that sibling next), so automatic cleanup never
+  // removes a Bridge tab after it has left our automation window at all.
+  const window = await chrome.windows.get(existing.windowId).catch(() => null);
+  const safeAutomationWindow =
+    existing.windowId === _automationWindowId && window && window.focused === false;
+  if (!safeAutomationWindow) {
+    return {
+      ok: false,
+      error:
+        "refusing to remove a tab from a user or foreground window " +
+        `(window=${existing.windowId}, automation=${_automationWindowId}, ` +
+        `state=${window?.state || "unknown"}, focused=${window?.focused ?? "unknown"})`,
+    };
+  }
+
+  let releasedRoutes = { managedScopes: [], sessions: [] };
   let routesChanged = false;
   const removal = chrome.tabs.remove(tabId).then(
     async () => {
@@ -437,6 +571,7 @@ async function discardBridgeTab(tabId) {
       // This handler remains attached after the race below has returned, so a
       // delayed refusal is not silently lost.
       console.warn("[Chrome Bridge] tabs.remove refused:", error);
+      releaseDrainingTab(scopeId, tabId);
       if (routesChanged) await restoreTabRoutes(tabId, releasedRoutes);
       return { ok: false, error };
     },
@@ -448,7 +583,7 @@ async function discardBridgeTab(tabId) {
   // confirmation race leaves a window where a concurrent named reopen can
   // select this doomed tab. _bridgeTabs intentionally remains untouched.
   releasedRoutes = releaseTabRoutes(tabId);
-  routesChanged = releasedRoutes.managed || releasedRoutes.sessions.length > 0;
+  routesChanged = releasedRoutes.managedScopes.length > 0 || releasedRoutes.sessions.length > 0;
   if (routesChanged) await persistState();
 
   const outcome = await Promise.race([removal, confirmationTimeout]);
@@ -460,6 +595,74 @@ async function discardBridgeTab(tabId) {
 
 chrome.tabs.onRemoved.addListener(forgetTab);
 
+// Tabs spawned by a bridge-owned page inherit its scope. This covers normal
+// window.open / target=_blank flows so task cleanup does not leave child tabs
+// behind. A child created while its scope is closing is discarded immediately.
+chrome.tabs.onCreated.addListener((tab) => {
+  void (async () => {
+    await _hydrated;
+    if (!tab.id || !tab.openerTabId) return;
+    const scopeId = _tabScopes.get(tab.openerTabId);
+    if (!scopeId) return;
+    _bridgeTabs.add(tab.id);
+    _tabScopes.set(tab.id, scopeId);
+    if (scopeIsClosing(scopeId)) markDrainingTab(scopeId, tab.id);
+    await syncCspRule();
+    await persistState();
+    // A page can request a separate popup window. Re-home that tab immediately
+    // so it cannot remain as a normal/focused Chrome window after creation.
+    if (_automationWindowId !== null && tab.windowId !== _automationWindowId) {
+      await withAutomationWindowLock(async () => {
+        const moved = await chrome.tabs
+          .move(tab.id, { windowId: _automationWindowId, index: -1 })
+          .catch(() => null);
+        if (!moved) {
+          await chrome.windows
+            .update(tab.windowId, { state: "minimized", focused: false })
+            .catch(() => {});
+        }
+        await chrome.windows
+          .update(_automationWindowId, { state: "minimized", focused: false })
+          .catch(() => {});
+      });
+    }
+    if (scopeIsClosing(scopeId)) await discardBridgeTab(tab.id);
+  })().catch((e) => console.warn("[Chrome Bridge] child-tab tracking failed", e));
+});
+
+// Chrome can swap a prerendered/Instant page into a new tab id. Transfer every
+// ownership route atomically so cleanup cannot lose the replacement.
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  void (async () => {
+    await _hydrated;
+    if (!_bridgeTabs.has(removedTabId)) return;
+    const scopeId = _tabScopes.get(removedTabId) || LEGACY_SCOPE;
+    _bridgeTabs.delete(removedTabId);
+    _bridgeTabs.add(addedTabId);
+    _tabScopes.delete(removedTabId);
+    _tabScopes.set(addedTabId, scopeId);
+    for (const [managedScope, id] of _managedTabs.entries()) {
+      if (id === removedTabId) _managedTabs.set(managedScope, addedTabId);
+    }
+    for (const [key, id] of _sessions.entries()) {
+      if (id === removedTabId) _sessions.set(key, addedTabId);
+    }
+    const draining = _drainingTabs.get(scopeId);
+    if (draining?.delete(removedTabId)) draining.add(addedTabId);
+    await syncCspRule();
+    await persistState();
+  })().catch((e) => console.warn("[Chrome Bridge] tab replacement tracking failed", e));
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  void (async () => {
+    await _hydrated;
+    if (_automationWindowId !== windowId) return;
+    _automationWindowId = null;
+    await persistState();
+  })().catch((e) => console.warn("[Chrome Bridge] window cleanup failed", e));
+});
+
 // ───────────────────────── 命令路由 ─────────────────────────
 
 const BROWSER_LEVEL = new Set([
@@ -467,6 +670,7 @@ const BROWSER_LEVEL = new Set([
   "get_cookies",
   "browse_open",
   "browse_close",
+  "close_owned_tabs",
   "list_sessions",
   "list_tabs",
 ]);
@@ -474,6 +678,10 @@ const BROWSER_LEVEL = new Set([
 async function handleCommand(msg) {
   await _hydrated;
   const { method, params = {} } = msg;
+  const scopedParams = {
+    ...params,
+    scope_id: normalizeScope(msg.scope_id ?? params.scope_id),
+  };
 
   switch (method) {
     // ── 浏览器级 ──
@@ -482,69 +690,78 @@ async function handleCommand(msg) {
       return { ok: true, message: "extension reloading..." };
 
     case "get_cookies":
-      return await cmdGetCookies(params);
+      return await cmdGetCookies(scopedParams);
 
     case "browse_open":
-      return await cmdBrowseOpen(params);
+      return await cmdBrowseOpen(scopedParams);
 
     case "browse_close":
-      return await cmdBrowseClose(params);
+      return await cmdBrowseClose(scopedParams);
+
+    case "close_owned_tabs":
+      return await cmdCloseOwnedTabs(scopedParams);
 
     case "list_sessions":
-      return [..._sessions.entries()].map(([name, tab_id]) => ({ name, tab_id: String(tab_id) }));
+      return listSessions(scopedParams.scope_id);
 
     case "list_tabs":
-      return await cmdListTabs(params);
+      return await cmdListTabs(scopedParams);
 
     case "activate_tab":
-      return await cmdActivateTab(params);
+      return await cmdActivateTab(scopedParams);
 
     // ── 需要 tab 但不在页面里执行的 ──
     case "navigate":
-      return await cmdNavigate(params);
+      return await cmdNavigate(scopedParams);
 
     case "wait_for_load":
-      return await cmdWaitForLoad(params);
+      return await cmdWaitForLoad(scopedParams);
 
     case "screenshot_element":
     case "screenshot":
-      return await cmdScreenshot(params);
+      return await cmdScreenshot(scopedParams);
 
     case "set_file_input":
-      return await cmdSetFileInput(params);
+      return await cmdSetFileInput(scopedParams);
 
     case "cdp_mouse":
-      return await cmdCdpMouse(params);
+      return await cmdCdpMouse(scopedParams);
 
     // ── 等待类命令：轮询必须留在 service worker 里 ──
     // Chrome 会把后台标签页的 setTimeout 节流到分钟级，页面内的轮询循环会
     // 慢到不可用。SW 不受这个节流，所以由它来打点、每次 executeScript 探一下。
     case "wait_for_selector": {
-      const tab = await resolveTab(params);
-      await waitForSelector(tab.id, params.selector, params.timeout || 30000);
+      const tab = await resolveTab(scopedParams);
+      await waitForSelector(tab.id, scopedParams.selector, scopedParams.timeout || 30000);
       return true;
     }
 
     case "wait_dom_stable": {
-      const tab = await resolveTab(params);
-      return await cmdWaitDomStable(tab, params);
+      const tab = await resolveTab(scopedParams);
+      return await cmdWaitDomStable(tab, scopedParams);
     }
 
     case "browse_do":
-      return await cmdBrowseDo(params);
+      return await cmdBrowseDo(scopedParams);
 
     case "browse_and_eval":
-      return await cmdBrowseAndEval(params);
+      return await cmdBrowseAndEval(scopedParams);
 
     // ── 其余全部在页面 MAIN world 里执行 ──
     default: {
       if (BROWSER_LEVEL.has(method)) throw bridgeError("BAD_REQUEST", `unrouted method: ${method}`);
-      const tab = await resolveTab(params);
-      if (params.wait_selector) {
-        await waitForSelector(tab.id, params.wait_selector, params.wait_timeout || 15000);
+      const tab = await resolveTab(scopedParams);
+      if (scopedParams.wait_selector) {
+        await waitForSelector(
+          tab.id,
+          scopedParams.wait_selector,
+          scopedParams.wait_timeout || 15000,
+        );
       }
-      if (method === "page_fetch" && params.max_inline == null) params.max_inline = MAX_INLINE_CHARS;
-      return await runInPage(tab.id, method, params);
+      if (method === "page_fetch" && scopedParams.max_inline == null) {
+        scopedParams.max_inline = MAX_INLINE_CHARS;
+      }
+      return await runInPage(tab.id, method, scopedParams);
     }
   }
 }
@@ -553,24 +770,26 @@ async function handleCommand(msg) {
 
 /**
  * 每个命令都可以带 tab_id（或 session 名）来指定作用的标签页；
- * 不带就用共享的 managed tab。这一层是 click_element / wait_for_selector /
+ * 不带就用当前 scope 的 managed tab。这一层是 click_element / wait_for_selector /
  * screenshot 等能在 browse session 里使用的原因。
  */
 async function resolveTab(params = {}) {
+  const scopeId = normalizeScope(params.scope_id);
   const ref = params.tab_id ?? params.session ?? null;
-  if (ref === null || ref === "") return await getOrOpenManagedTab();
+  if (ref === null || ref === "") return await getOrOpenManagedTab(scopeId);
 
-  if (typeof ref === "string" && _sessions.has(ref)) {
-    return await getTabOrThrow(_sessions.get(ref), ref);
+  const key = typeof ref === "string" ? sessionKey(scopeId, ref) : null;
+  if (key && _sessions.has(key)) {
+    return await getTabOrThrow(_sessions.get(key), ref, scopeId);
   }
   const numeric = Number(ref);
   if (!Number.isFinite(numeric)) {
     throw bridgeError("TAB_GONE", `unknown tab or session: ${ref}`);
   }
-  return await getTabOrThrow(numeric, ref);
+  return await getTabOrThrow(numeric, ref, scopeId);
 }
 
-async function getTabOrThrow(tabId, label) {
+async function getTabOrThrow(tabId, label, scopeId) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) {
     throw bridgeError(
@@ -579,58 +798,79 @@ async function getTabOrThrow(tabId, label) {
       { tab_id: String(tabId) },
     );
   }
+  const owner = _tabScopes.get(tab.id);
+  if (owner && owner !== scopeId) {
+    throw bridgeError("TAB_SCOPE_MISMATCH", "refusing to target another Chrome Bridge scope's tab", {
+      tab_id: String(tab.id),
+    });
+  }
   return tab;
 }
 
-async function getOrOpenManagedTab() {
-  if (_managedTabId !== null) {
-    const existing = await chrome.tabs.get(_managedTabId).catch(() => null);
+async function getOrOpenManagedTab(scopeId) {
+  const managedTabId = _managedTabs.get(scopeId);
+  if (managedTabId !== undefined) {
+    const existing = await chrome.tabs.get(managedTabId).catch(() => null);
     if (existing) return existing;
+    _managedTabs.delete(scopeId);
   }
-  const tab = await createBridgeTab(null);
-  _managedTabId = tab.id;
+  const tab = await createBridgeTab(null, scopeId);
+  _managedTabs.set(scopeId, tab.id);
   await persistState();
   return tab;
 }
 
 /**
- * 开一个后台标签页。
- *
- * `chrome.tabs.create` 不带 windowId 时打到「当前窗口」，而 Chrome 在没有
- * 窗口的时候（用户关掉了所有窗口，但 "continue running background apps"
- * 让 service worker 还活着）会直接抛 "No current window" —— 整座桥就废了。
- * 这种情况下退回到任意一个普通窗口，实在没有就自己开一个不抢焦点的。
+ * Open a tab in one minimized, unfocused automation window. Never omit
+ * windowId: doing so puts the tab in the user's current window and interrupts
+ * both their tab strip and concurrent bridge runs.
  */
 async function newBackgroundTab() {
-  try {
-    return await chrome.tabs.create({ url: "about:blank", active: false });
-  } catch (e) {
-    if (!/no current window|no window with id/i.test(String(e.message || e))) throw e;
-  }
+  return await withAutomationWindowLock(async () => {
+    if (_automationWindowId !== null) {
+      const existingWindow = await chrome.windows
+        .get(_automationWindowId, { populate: false })
+        .catch(() => null);
+      if (existingWindow) {
+        if (existingWindow.state !== "minimized") {
+          await chrome.windows
+            .update(_automationWindowId, { state: "minimized", focused: false })
+            .catch(() => {});
+        }
+        try {
+          return await chrome.tabs.create({
+            url: "about:blank",
+            active: false,
+            windowId: _automationWindowId,
+          });
+        } catch (e) {
+          if (!/no current window|no window with id/i.test(String(e.message || e))) throw e;
+          _automationWindowId = null;
+        }
+      } else {
+        _automationWindowId = null;
+      }
+    }
 
-  const windows = await chrome.windows.getAll({ windowTypes: ["normal"] }).catch(() => []);
-  if (windows.length) {
-    return await chrome.tabs.create({
+    // A new window includes one seed tab; reuse it instead of creating a
+    // second blank tab. focused:false + minimized is the no-focus invariant.
+    const created = await chrome.windows.create({
       url: "about:blank",
-      active: false,
-      windowId: windows[0].id,
+      type: "normal",
+      focused: false,
+      state: "minimized",
     });
-  }
-
-  // 一个窗口都没有：自己开一个，不抢焦点。新窗口自带一个标签页，直接用它。
-  const created = await chrome.windows.create({
-    url: "about:blank",
-    focused: false,
-    state: "minimized",
+    _automationWindowId = created.id;
+    const tabs =
+      created && created.tabs
+        ? created.tabs
+        : await chrome.tabs.query({ windowId: created.id });
+    if (!tabs || !tabs.length) {
+      _automationWindowId = null;
+      throw bridgeError("NO_AUTOMATION_WINDOW", "Chrome did not create an automation tab");
+    }
+    return tabs[0];
   });
-  const tabs = created && created.tabs ? created.tabs : await chrome.tabs.query({ windowId: created.id });
-  if (!tabs || !tabs.length) {
-    throw bridgeError(
-      "NO_BROWSER_WINDOW",
-      "Chrome has no window to open a tab in. Open a Chrome window and retry.",
-    );
-  }
-  return tabs[0];
 }
 
 /**
@@ -638,23 +878,36 @@ async function newBackgroundTab() {
  * 先开 about:blank 并登记进 CSP 白名单，再导航 —— 否则目标页的响应头
  * 已经到了，CSP 规则来不及生效。
  */
-async function createBridgeTab(url) {
-  const tab = await newBackgroundTab();
-  _bridgeTabs.add(tab.id);
-  await syncCspRule();
-  await persistState();
+async function createBridgeTab(url, scope_id = LEGACY_SCOPE) {
+  const scopeId = normalizeScope(scope_id);
+  const finishCreate = beginScopeActivity(scopeId);
   try {
-    if (url && url !== "about:blank") {
-      await chrome.tabs.update(tab.id, { url });
+    if (scopeIsClosing(scopeId)) {
+      throw bridgeError("SCOPE_CLOSING", "this Chrome Bridge scope is being cleaned up");
     }
-  } catch (e) {
-    const discarded = await discardBridgeTab(tab.id);
-    if (!discarded.ok || discarded.confirmed !== true) {
-      throw tabCleanupError(tab.id, e, discarded);
+    const tab = await newBackgroundTab();
+    _bridgeTabs.add(tab.id);
+    _tabScopes.set(tab.id, scopeId);
+    await syncCspRule();
+    await persistState();
+    try {
+      if (scopeIsClosing(scopeId)) {
+        throw bridgeError("SCOPE_CLOSING", "this Chrome Bridge scope is being cleaned up");
+      }
+      if (url && url !== "about:blank") {
+        await chrome.tabs.update(tab.id, { url });
+      }
+    } catch (e) {
+      const discarded = await discardBridgeTab(tab.id);
+      if (!discarded.ok || discarded.confirmed !== true) {
+        throw tabCleanupError(tab.id, e, discarded);
+      }
+      throw e;
     }
-    throw e;
+    return tab;
+  } finally {
+    finishCreate();
   }
-  return tab;
 }
 
 function tabCleanupError(tabId, original, discarded) {
@@ -861,7 +1114,13 @@ async function cmdGetCookies({ domain = null, all_domains = false } = {}) {
  * Needed because Chrome will not deliver CDP `Input.dispatchMouseEvent`
  * press/release to a background tab — see cmdCdpMouse.
  */
-async function cmdActivateTab({ restore_to = null, ...rest }) {
+async function cmdActivateTab({ restore_to = null, allow_foreground = false, ...rest }) {
+  if (allow_foreground !== true) {
+    throw bridgeError(
+      "FOREGROUND_REQUIRED",
+      "activate_tab would bring Chrome to the foreground; pass allow_foreground=true only with user consent",
+    );
+  }
   if (restore_to) {
     const prev = await chrome.tabs.get(Number(restore_to)).catch(() => null);
     if (prev) {
@@ -881,7 +1140,20 @@ async function cmdActivateTab({ restore_to = null, ...rest }) {
   };
 }
 
-async function cmdListTabs({ url_contains = "" } = {}) {
+function listSessions(scope_id = LEGACY_SCOPE) {
+  const scopeId = normalizeScope(scope_id);
+  const sessions = [];
+  for (const [key, tabId] of _sessions.entries()) {
+    const parsed = parseSessionKey(key);
+    if (parsed.scope_id === scopeId) {
+      sessions.push({ name: parsed.name, tab_id: String(tabId) });
+    }
+  }
+  return sessions;
+}
+
+async function cmdListTabs({ url_contains = "", scope_id = LEGACY_SCOPE } = {}) {
+  const scopeId = normalizeScope(scope_id);
   const tabs = await chrome.tabs.query({});
   return tabs
     .filter((t) => !url_contains || (t.url || "").includes(url_contains))
@@ -894,6 +1166,7 @@ async function cmdListTabs({ url_contains = "" } = {}) {
       title: t.title,
       active: t.active,
       bridge_owned: _bridgeTabs.has(t.id),
+      bridge_owned_by_scope: _tabScopes.get(t.id) === scopeId,
     }));
 }
 
@@ -971,27 +1244,53 @@ async function settleBrowseOpen(settleMs, deadline, timeout) {
 }
 
 async function cmdBrowseOpen(params = {}) {
-  const name = params.name ?? null;
-  const timeout = params.timeout ?? 60000;
-  const deadline = Date.now() + timeout;
-  if (name === null) return await cmdBrowseOpenUnlocked(params, deadline);
-  return await withSessionOpenLock(name, deadline, timeout, () =>
-    cmdBrowseOpenUnlocked(params, deadline),
-  );
+  const scopeId = normalizeScope(params.scope_id);
+  const finishOpen = beginScopeActivity(scopeId);
+  try {
+    if (scopeIsClosing(scopeId)) {
+      throw bridgeError("SCOPE_CLOSING", "this Chrome Bridge scope is being cleaned up");
+    }
+    const name = params.name ?? null;
+    if (
+      name !== null &&
+      (typeof name !== "string" ||
+        !name.trim() ||
+        /^\d+$/.test(name) ||
+        name.includes(SESSION_KEY_SEPARATOR))
+    ) {
+      throw bridgeError(
+        "BAD_REQUEST",
+        "session name must be a non-empty, non-numeric string without control separators",
+      );
+    }
+    const timeout = params.timeout ?? 60000;
+    const deadline = Date.now() + timeout;
+    if (name === null) return await cmdBrowseOpenUnlocked(params, deadline);
+    const key = sessionKey(scopeId, name);
+    return await withSessionOpenLock(key, deadline, timeout, () =>
+      cmdBrowseOpenUnlocked({ ...params, session_key: key }, deadline),
+    );
+  } finally {
+    finishOpen();
+  }
 }
 
 async function cmdBrowseOpenUnlocked({
   url,
   timeout = 60000,
   name = null,
+  scope_id = LEGACY_SCOPE,
+  session_key = null,
   settle_ms = 2000,
   wait_selector = null,
 }, deadline) {
+  const scopeId = normalizeScope(scope_id);
+  const key = name ? session_key || sessionKey(scopeId, name) : null;
   // Navigation, settling, selector waits, stale-tab recovery, and named reuse
   // all consume one caller-visible budget.
   // 命名 session：同名已有活标签页就复用，不再每跑一次泄漏一个标签页。
-  if (name && _sessions.has(name)) {
-    const sessionTabId = _sessions.get(name);
+  if (key && _sessions.has(key)) {
+    const sessionTabId = _sessions.get(key);
     const existing = await chrome.tabs.get(sessionTabId).catch(() => null);
     if (existing) {
       try {
@@ -1031,7 +1330,7 @@ async function cmdBrowseOpenUnlocked({
     let tab = null;
     try {
       remainingBrowseOpenTime(deadline, timeout, "opening a tab");
-      tab = await createBridgeTab(url);
+      tab = await createBridgeTab(url, scopeId);
       // 标签页是先建成 about:blank 再导航的（为了让 CSP 规则先生效），所以要
       // 明确等 URL 真的离开 about:blank，不能一看到 complete 就返回。
       await waitForTabComplete(tab.id, {
@@ -1048,8 +1347,8 @@ async function cmdBrowseOpenUnlocked({
       }
       remainingBrowseOpenTime(deadline, timeout, "finishing browse_open");
 
-      if (name) {
-        _sessions.set(name, tab.id);
+      if (key) {
+        _sessions.set(key, tab.id);
         await persistState();
       }
       const updated = await chrome.tabs.get(tab.id);
@@ -1084,15 +1383,39 @@ async function cmdBrowseOpenUnlocked({
   }
 }
 
-async function cmdBrowseDo({ tab_id, expression, wait_selector = null, wait_timeout = 15000 }) {
-  const tab = await resolveTab({ tab_id });
+async function cmdBrowseDo({
+  tab_id,
+  expression,
+  wait_selector = null,
+  wait_timeout = 15000,
+  scope_id = LEGACY_SCOPE,
+}) {
+  const tab = await resolveTab({ tab_id, scope_id });
   if (wait_selector) await waitForSelector(tab.id, wait_selector, wait_timeout);
   return await runInPage(tab.id, "evaluate", { expression });
 }
 
-async function cmdBrowseClose({ tab_id }) {
-  const tab = await resolveTab({ tab_id }).catch(() => null);
-  if (!tab) return { closed: false };
+async function cmdBrowseClose({ tab_id, scope_id = LEGACY_SCOPE }) {
+  const scopeId = normalizeScope(scope_id);
+  let tab;
+  try {
+    tab = await resolveTab({ tab_id, scope_id: scopeId });
+  } catch (e) {
+    if (e && e.bridge && e.bridge.code === "TAB_GONE") return { closed: false };
+    throw e;
+  }
+
+  const owner = _tabScopes.get(tab.id);
+  if (!owner) {
+    throw bridgeError("TAB_NOT_OWNED", "refusing to close a tab not opened by Chrome Bridge", {
+      tab_id: String(tab.id),
+    });
+  }
+  if (owner !== scopeId) {
+    throw bridgeError("TAB_SCOPE_MISMATCH", "refusing to close another Chrome Bridge scope's tab", {
+      tab_id: String(tab.id),
+    });
+  }
 
   const discarded = await discardBridgeTab(tab.id);
   if (!discarded.ok) {
@@ -1101,12 +1424,68 @@ async function cmdBrowseClose({ tab_id }) {
   return { closed: true, confirmed: discarded.confirmed };
 }
 
-async function cmdBrowseAndEval({ url, expression, wait_selector = null, timeout = 30000 }) {
-  const opened = await cmdBrowseOpen({ url, timeout, wait_selector });
+async function cmdCloseOwnedTabs({ scope_id = LEGACY_SCOPE } = {}) {
+  const scopeId = normalizeScope(scope_id);
+  const attempted = new Set();
+  const result = { requested: 0, confirmed: [], pending: [], refused: [], remaining: [] };
+  _closingScopes.add(scopeId);
   try {
-    return await cmdBrowseDo({ tab_id: opened.tab_id, expression });
+    // Close anything already visible first so an in-flight wait/navigation is
+    // interrupted promptly. Then drain every open/create operation that began
+    // before cleanup, and sweep again for tabs it registered along the way.
+    for (let phase = 0; phase < 2; phase++) {
+      let idleTurns = 0;
+      while (idleTurns < 2) {
+        const targets = [..._bridgeTabs].filter(
+          (tabId) => _tabScopes.get(tabId) === scopeId && !attempted.has(tabId),
+        );
+        if (!targets.length) {
+          idleTurns += 1;
+          await sleep(0);
+          continue;
+        }
+        idleTurns = 0;
+        for (const tabId of targets) {
+          attempted.add(tabId);
+          result.requested += 1;
+          const discarded = await discardBridgeTab(tabId);
+          if (!discarded.ok) {
+            result.refused.push({ tab_id: String(tabId), error: discarded.error });
+          } else if (discarded.confirmed === true) {
+            result.confirmed.push(String(tabId));
+          } else {
+            result.pending.push(String(tabId));
+          }
+        }
+      }
+      if (phase === 0) await waitForScopeActivities(scopeId);
+    }
   } finally {
-    await cmdBrowseClose({ tab_id: opened.tab_id });
+    for (const tabId of result.pending.map(Number)) {
+      if (_bridgeTabs.has(tabId) && _tabScopes.get(tabId) === scopeId) {
+        markDrainingTab(scopeId, tabId);
+      }
+    }
+    _closingScopes.delete(scopeId);
+  }
+  result.remaining = [..._bridgeTabs]
+    .filter((tabId) => _tabScopes.get(tabId) === scopeId)
+    .map(String);
+  return result;
+}
+
+async function cmdBrowseAndEval({
+  url,
+  expression,
+  wait_selector = null,
+  timeout = 30000,
+  scope_id = LEGACY_SCOPE,
+}) {
+  const opened = await cmdBrowseOpen({ url, timeout, wait_selector, scope_id });
+  try {
+    return await cmdBrowseDo({ tab_id: opened.tab_id, expression, scope_id });
+  } finally {
+    await cmdBrowseClose({ tab_id: opened.tab_id, scope_id });
   }
 }
 
@@ -1133,34 +1512,69 @@ async function cmdCdpMouse({
   y2,
   button = "left",
   steps = 12,
-  activate = true,
+  activate = false,
   ...rest
 }) {
   const tab = await resolveTab(rest);
   const nap = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // Chrome always delivers CDP mouseMoved to a background tab, but
-  // mousePressed/mouseReleased only arrive if that tab's renderer still has a
-  // live surface — a click on a tab that has been backgrounded for a while
-  // silently goes nowhere. Raising the tab makes it deterministic; we put back
-  // whatever the user was looking at. `activate: false` opts out.
-  let restoreTo = null;
-  if (activate && !tab.active) {
-    const [previous] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-    if (previous && previous.id !== tab.id) restoreTo = previous;
-    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
-    await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-    await nap(120); // let the compositor present a frame before we click it
+  // Chrome always delivers mouseMoved to a background target, but trusted
+  // press/release needs a visible live surface. Fail closed by default instead
+  // of silently foregrounding Chrome and interrupting another application.
+  const needsLiveSurface = action !== "move";
+  if (!needsLiveSurface) {
+    return await runCdpMouse(tab, { action, x, y, x2, y2, button, steps }, nap);
   }
 
-  try {
-    return await runCdpMouse(tab, { action, x, y, x2, y2, button, steps }, nap);
-  } finally {
-    if (restoreTo) {
-      await chrome.tabs.update(restoreTo.id, { active: true }).catch(() => {});
-      await chrome.windows.update(restoreTo.windowId, { focused: true }).catch(() => {});
+  // Every trusted input holds the same window lock used by background tab
+  // creation, even when the target is already foregrounded. Re-check after
+  // acquiring it because another queued operation may have minimized the
+  // window while this command was waiting.
+  return await withAutomationWindowLock(async () => {
+    const liveTab = await chrome.tabs.get(tab.id).catch(() => tab);
+    const liveWindow = await chrome.windows.get(liveTab.windowId).catch(() => null);
+    const backgrounded =
+      !liveTab.active ||
+      !liveWindow ||
+      liveWindow.state === "minimized" ||
+      !liveWindow.focused;
+    if (backgrounded && activate !== true) {
+      throw bridgeError(
+        "FOREGROUND_REQUIRED",
+        "trusted CDP click/drag needs a foreground surface; use DOM actions or explicitly pass activate=true with user consent",
+      );
     }
-  }
+    if (!backgrounded) {
+      return await runCdpMouse(liveTab, { action, x, y, x2, y2, button, steps }, nap);
+    }
+
+    const [previous] = await chrome.tabs.query({ active: true, windowId: liveTab.windowId });
+    const restoreTo = previous && previous.id !== liveTab.id ? previous : null;
+    const windows = await chrome.windows.getAll({ windowTypes: ["normal"] }).catch(() => []);
+    const restoreWindow =
+      windows.find((window) => window.focused && window.id !== liveTab.windowId) || null;
+    if (liveWindow.state === "minimized") {
+      await chrome.windows.update(liveTab.windowId, { state: "normal" }).catch(() => {});
+    }
+    await chrome.tabs.update(liveTab.id, { active: true }).catch(() => {});
+    await chrome.windows.update(liveTab.windowId, { focused: true }).catch(() => {});
+    await nap(120); // let the compositor present a frame before we click it
+    try {
+      return await runCdpMouse(liveTab, { action, x, y, x2, y2, button, steps }, nap);
+    } finally {
+      if (restoreTo) {
+        await chrome.tabs.update(restoreTo.id, { active: true }).catch(() => {});
+      }
+      if (liveWindow.state === "minimized") {
+        await chrome.windows
+          .update(liveTab.windowId, { state: "minimized", focused: false })
+          .catch(() => {});
+      }
+      if (restoreWindow) {
+        await chrome.windows.update(restoreWindow.id, { focused: true }).catch(() => {});
+      }
+    }
+  });
 }
 
 async function runCdpMouse(tab, { action, x, y, x2, y2, button, steps }, nap) {

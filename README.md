@@ -133,7 +133,10 @@ Version 2.0 intentionally breaks the old implicit full-profile cookie export.
 `page.get_cookies()` and `chrome-bridge cookies` now require either one domain
 or an explicit all-domain opt-in. Restart the relay and reload the unpacked
 extension after upgrading. `chrome-bridge status` should show both
-`server_version` and `extension_version` as `2.0.0`.
+`server_version` and `extension_version` as `2.1.0`.
+If an older extension left tracked tabs behind during the upgrade, run
+`chrome-bridge --scope legacy cleanup` once; ownership checks still prevent
+that command from closing ordinary user tabs.
 
 ### Step 2 — Load the Chrome extension (one-time)
 
@@ -174,7 +177,7 @@ uv run python scripts/bridge_server.py
 Output will look roughly like:
 
 ```
-INFO:chrome-bridge:Chrome Bridge server 2.0.0 listening on ws://localhost:9333
+INFO:chrome-bridge:Chrome Bridge server 2.1.0 listening on ws://localhost:9333
 INFO:chrome-bridge:auth enabled; token at /Users/you/.chrome-bridge-token
 INFO:chrome-bridge:waiting for the Chrome extension to connect...
 INFO:chrome-bridge:extension connected
@@ -192,15 +195,16 @@ first start; the Python client picks it up automatically. See
 
 ```bash
 python3 scripts/bridge_client.py status
-# {"extension_connected": true, "pending": 0, "server_version": "2.0.0"}
+# {"extension_connected": true, "pending": 0, "server_version": "2.1.0"}
 
 python3 scripts/bridge_client.py eval 'document.title' --url https://example.com
 # "Example Domain"
 ```
 
-If `extension_connected` is `false`, see Step 2 (the extension is installed
-but Chrome restarted and hasn't reconnected yet — open `chrome://extensions`
-and click the ↻ on the extension card).
+If `extension_connected` is `false`, poll `status` for up to 35 seconds first.
+The MV3 worker reconnects with exponential backoff and normally recovers
+without touching Chrome. Only if it remains disconnected should you open
+`chrome://extensions` and click ↻ on the extension card.
 
 ### Common pitfalls
 
@@ -220,19 +224,21 @@ and click the ↻ on the extension card).
 - **Server port already in use.** Default is 9333. Pass `--port 9444` (or
   any free port) and update `BRIDGE_URL` in `bridge_client.py`
   accordingly.
-- **Parallel scripts race on the shared managed tab.** Verbs called straight
-  on `BridgePage` all target one persistent background tab, so two scripts
-  that both call `navigate()` clobber each other. Use a session instead —
-  `with page.tab(url) as tab:` gives each script its own tab, and every verb
-  on that `Tab` targets it.
-- **Bridge doesn't steal focus** (since 2026-05-16). Tabs are opened with
-  `active: false` and reused across calls, so the user's visible window is
-  not hijacked. Details:
+- **Parallel runs are ownership-scoped.** Each `BridgePage` gets a distinct
+  scope for its managed tab, named sessions, and cleanup, so separate agents
+  cannot navigate or close one another's tabs. Concurrent verbs on the *same*
+  page still share its managed tab; use one bound `page.tab(url)` per flow.
+- **Bridge tabs use a dedicated minimized window.** The extension never puts a
+  new tab in the user's current window and ordinary actions never request OS
+  focus. Details:
   [`references/background-tab-fix.md`](references/background-tab-fix.md).
-  **The single exception is `cdp_mouse`**: Chrome does not reliably deliver
-  CDP press/release to a tab that isn't visible, so that call raises the tab
-  for a sub-second and then restores whatever the user was on. Pass
-  `activate=False` to forbid it, at the risk of the click going nowhere.
+  Trusted `cdp_mouse` click/drag fails with `FOREGROUND_REQUIRED` by default;
+  foregrounding is an explicit opt-in because Chrome cannot reliably restore
+  the focus of a different macOS application.
+- **Cleanup removes owned tabs, never user windows.** There is no window-close
+  command. If an owned tab is moved out of the automation window, cleanup
+  reports a refusal and leaves it alone, avoiding even a last-tab race that
+  could make Chrome implicitly close a user window.
 
 ---
 
@@ -252,10 +258,9 @@ This is the kind of thing every other tool fails at:
 import re
 from bridge_client import BridgePage
 
-page = BridgePage()
-
-# The session closes itself, even if something below raises.
-with page.tab("https://www.xiaohongshu.com/explore", timeout=45) as tab:
+# The outer scope closes every bridge-created tab, even if something below raises.
+with BridgePage() as page:
+  with page.tab("https://www.xiaohongshu.com/explore", timeout=45) as tab:
 
     # 1. Pull all session cookies for xiaohongshu. These are the same cookies
     #    your real browser uses — feed them straight into requests/httpx if
@@ -319,18 +324,18 @@ Full list in `scripts/bridge_client.py`; the agent-facing contract is
 ```python
 from bridge_client import BridgePage
 
-page = BridgePage()
-
-with page.tab("https://app.example/dashboard") as tab:   # closed on exit
-    tab.click_element("#filter")
-    tab.wait_for_element(".row", timeout=20)
-    rows = tab.evaluate("document.querySelectorAll('.row').length")
+with BridgePage() as page:                                # scoped task cleanup
+    with page.tab("https://app.example/dashboard") as tab:  # closed on exit
+        tab.click_element("#filter")
+        tab.wait_for_element(".row", timeout=20)
+        rows = tab.evaluate("document.querySelectorAll('.row').length")
 ```
 
 A `Tab` *is* a `BridgePage` bound to one tab, so every verb targets it —
-no more "did that click land on the shared tab?". `name=` reuses the same tab
-across runs (and, being named, survives the `with` block — close it yourself);
-`page.list_tabs("host.com")` attaches to a tab **you** already have open.
+no more "did that click land on the wrong tab?". `name=` reuses the same tab
+inside one ownership scope and survives the inner `Tab` block; the outer
+`BridgePage` context closes it. `page.list_tabs("host.com")` attaches to a tab
+**you** already have open, but scoped close operations refuse that user tab.
 
 ### Agent-native snapshot — stop guessing selectors
 
@@ -359,7 +364,8 @@ Runs inside the page's origin, so cookies and same-origin CSRF pass.
 ```python
 page.browse_and_eval(url, expression, timeout=30000)
 page.browse_open(url) / page.browse_do(tab_id, js) / page.browse_close(tab_id)
-page.navigate(url); page.evaluate(js)          # shared managed tab
+page.navigate(url); page.evaluate(js)          # this scope's managed tab
+page.close_owned_tabs()                        # this scope only
 ```
 
 ### Everything else
@@ -380,10 +386,10 @@ message strings.
 
 ```bash
 chrome-bridge eval 'document.title' --url https://example.com
-chrome-bridge snapshot --session dash
-chrome-bridge fetch https://internal/api/x --json
-chrome-bridge screenshot --selector "#chart" --out chart.png
-chrome-bridge status | list-tabs | list-sessions | reload
+chrome-bridge snapshot --url https://example.com
+chrome-bridge --scope task-a --url https://example.com --session dash snapshot
+chrome-bridge --scope task-a cleanup
+chrome-bridge status | list-tabs | reload
 ```
 
 (Without installing: `python3 scripts/bridge_client.py ...`.)

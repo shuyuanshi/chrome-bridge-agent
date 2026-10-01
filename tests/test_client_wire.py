@@ -217,6 +217,131 @@ def test_unbound_page_sends_no_tab_id() -> None:
         assert "tab_id" not in relay.last_params()
 
 
+def test_scope_is_opaque_stable_and_sent_on_every_call() -> None:
+    with FakeRelay() as relay:
+        first = page_for(relay, scope_id="agent-a")
+        second = page_for(relay, scope_id="agent-a")
+        other = page_for(relay, scope_id="agent-b")
+        first.evaluate("1")
+        second.evaluate("2")
+        other.evaluate("3")
+
+        assert first.scope_id == second.scope_id
+        assert first.scope_id != other.scope_id
+        assert first.scope_id.startswith("cb-")
+        assert [frame["scope_id"] for frame in relay.frames] == [
+            first.scope_id,
+            first.scope_id,
+            other.scope_id,
+        ]
+
+
+def test_legacy_scope_is_reserved_for_upgrade_cleanup() -> None:
+    assert BridgePage(scope_id="legacy").scope_id == "legacy"
+
+
+def test_tab_inherits_its_parent_scope() -> None:
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "browse_open":
+            return {"result": {"tab_id": "77", "url": "https://x/", "status": "ready"}}
+        return {"result": None}
+
+    with FakeRelay(responder) as relay:
+        page = page_for(relay, scope_id="agent-a")
+        with page.tab("https://x/") as tab:
+            tab.evaluate("1")
+        assert {frame["scope_id"] for frame in relay.frames} == {page.scope_id}
+
+
+def test_page_context_cleans_its_scope_even_when_body_raises() -> None:
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "close_owned_tabs":
+            return {"result": {"requested": 0, "pending": [], "refused": []}}
+        if msg["method"] == "list_tabs":
+            return {"result": []}
+        return {"result": None}
+
+    with (
+        FakeRelay(responder) as relay,
+        pytest.raises(ZeroDivisionError),
+        page_for(relay, scope_id="agent-a"),
+    ):
+        raise ZeroDivisionError
+    assert [frame["method"] for frame in relay.frames] == ["close_owned_tabs", "list_tabs"]
+
+
+def test_page_context_reports_tabs_left_open_after_cleanup() -> None:
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "close_owned_tabs":
+            return {"result": {"requested": 1, "pending": [], "refused": []}}
+        if msg["method"] == "list_tabs":
+            return {
+                "result": [{"tab_id": "2", "bridge_owned": True, "bridge_owned_by_scope": True}]
+            }
+        return {"result": None}
+
+    with (
+        FakeRelay(responder) as relay,
+        pytest.raises(BridgeError) as excinfo,
+        page_for(relay, scope_id="agent-a"),
+    ):
+        pass
+    assert excinfo.value.code == "TAB_CLEANUP_FAILED"
+
+
+def test_close_owned_tabs_ignores_other_scopes() -> None:
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "close_owned_tabs":
+            return {"result": {"requested": 1, "confirmed": ["1"], "pending": [], "refused": []}}
+        if msg["method"] == "list_tabs":
+            return {
+                "result": [
+                    {"tab_id": "2", "bridge_owned": True, "bridge_owned_by_scope": False},
+                    {"tab_id": "3", "bridge_owned": False, "bridge_owned_by_scope": False},
+                ]
+            }
+        return {"result": None}
+
+    with FakeRelay(responder) as relay:
+        page = page_for(relay, scope_id="agent-a")
+        result = page.close_owned_tabs()
+        assert result["confirmed"] == ["1"]
+        assert result["remaining"] == []
+        assert {frame["scope_id"] for frame in relay.frames} == {page.scope_id}
+
+
+def test_close_owned_tabs_wait_false_returns_accepted_pending_tabs() -> None:
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "close_owned_tabs":
+            return {
+                "result": {
+                    "requested": 1,
+                    "confirmed": [],
+                    "pending": ["1"],
+                    "refused": [],
+                }
+            }
+        if msg["method"] == "list_tabs":
+            return {
+                "result": [{"tab_id": "1", "bridge_owned": True, "bridge_owned_by_scope": True}]
+            }
+        return {"result": None}
+
+    with FakeRelay(responder) as relay:
+        result = page_for(relay, scope_id="agent-a").close_owned_tabs(wait=False)
+    assert result["pending"] == ["1"]
+    assert result["remaining"] == ["1"]
+
+
+def test_foreground_actions_are_opt_in_on_the_wire() -> None:
+    with FakeRelay() as relay:
+        page = page_for(relay, tab_id="4")
+        page.cdp_mouse("move", x=1, y=2)
+        assert relay.last_params()["activate"] is False
+        page.activate_tab()
+        assert relay.last_params()["allow_foreground"] is False
+
+
 def test_tab_context_manager_opens_and_closes() -> None:
     def responder(msg: dict) -> dict:
         if msg["method"] == "browse_open":
@@ -267,6 +392,43 @@ def test_tab_is_closed_even_when_the_body_raises() -> None:
         with pytest.raises(ZeroDivisionError), page.tab("https://x/"):
             raise ZeroDivisionError
         assert [f["method"] for f in relay.frames][-1] == "browse_close"
+
+
+def test_tab_context_reports_a_close_failure_when_the_body_succeeds() -> None:
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "browse_open":
+            return {"result": {"tab_id": "5", "url": "u", "status": "ready"}}
+        if msg["method"] == "browse_close":
+            return {"error": {"code": "TAB_CLOSE_FAILED", "message": "refused"}}
+        return {"result": None}
+
+    with (
+        FakeRelay(responder) as relay,
+        pytest.raises(BridgeError) as excinfo,
+        page_for(relay).tab("https://x/"),
+    ):
+        pass
+    assert excinfo.value.code == "TAB_CLOSE_FAILED"
+
+
+def test_browse_and_eval_reports_cleanup_failure_after_success() -> None:
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "browse_open":
+            return {"result": {"tab_id": "5", "url": "u", "status": "ready"}}
+        if msg["method"] == "browse_do":
+            return {"result": "answer"}
+        if msg["method"] == "browse_close":
+            return {"error": {"code": "TAB_CLOSE_FAILED", "message": "refused"}}
+        return {"result": None}
+
+    with FakeRelay(responder) as relay, pytest.raises(BridgeError) as excinfo:
+        page_for(relay).browse_and_eval("https://x/", "1")
+    assert excinfo.value.code == "TAB_CLOSE_FAILED"
+
+
+def test_numeric_session_names_are_rejected() -> None:
+    with FakeRelay() as relay, pytest.raises(ValueError, match="non-numeric"):
+        page_for(relay).browse_open("https://x/", name="123")
 
 
 # ─────────────────── error taxonomy ───────────────────
@@ -571,6 +733,208 @@ def test_cli_cookie_export_requires_exactly_one_scope() -> None:
     with pytest.raises(SystemExit) as empty:
         main(["cookies", "--domain", "   "])
     assert empty.value.code == 2
+
+
+def test_cli_persistent_sessions_and_cleanup_require_an_explicit_scope() -> None:
+    from bridge_client import main
+
+    with pytest.raises(SystemExit) as session_error:
+        main(["--session", "dash", "snapshot"])
+    assert session_error.value.code == 2
+
+    with pytest.raises(SystemExit) as cleanup_error:
+        main(["cleanup"])
+    assert cleanup_error.value.code == 2
+
+    with pytest.raises(SystemExit) as listing_error:
+        main(["list-sessions"])
+    assert listing_error.value.code == 2
+
+
+def test_cli_existing_named_session_keeps_the_explicit_scope(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from bridge_client import BridgePage, main
+
+    expected_scope = BridgePage(scope_id="agent-a").scope_id
+
+    def responder(msg: dict) -> dict:
+        assert msg["scope_id"] == expected_scope
+        assert msg["params"]["tab_id"] == "dash"
+        return {"result": "Dashboard"}
+
+    with FakeRelay(responder) as relay:
+        assert (
+            main(
+                [
+                    "--bridge-url",
+                    relay.url,
+                    "--scope",
+                    "agent-a",
+                    "--session",
+                    "dash",
+                    "eval",
+                    "document.title",
+                ]
+            )
+            == 0
+        )
+        assert capsys.readouterr().out.strip() == "Dashboard"
+
+
+def test_cli_anonymous_url_does_not_clean_a_persistent_scope(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from bridge_client import BridgePage, main
+
+    persistent_scope = BridgePage(scope_id="task-a").scope_id
+
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "browse_open":
+            return {"result": {"tab_id": "3", "url": "u", "status": "ready"}}
+        if msg["method"] == "browse_close":
+            return {"result": {"closed": True, "confirmed": True}}
+        if msg["method"] == "close_owned_tabs":
+            return {"result": {"requested": 0, "confirmed": [], "pending": [], "refused": []}}
+        if msg["method"] == "list_tabs":
+            return {"result": []}
+        return {"result": "Title"}
+
+    with FakeRelay(responder) as relay:
+        assert (
+            main(
+                [
+                    "--bridge-url",
+                    relay.url,
+                    "--scope",
+                    "task-a",
+                    "--url",
+                    "https://x/",
+                    "eval",
+                    "document.title",
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+        cleanup_frames = [frame for frame in relay.frames if frame["method"] == "close_owned_tabs"]
+        assert cleanup_frames
+        assert all(frame["scope_id"] != persistent_scope for frame in cleanup_frames)
+
+
+def test_cli_anonymous_url_ignores_persistent_env_scope_for_cleanup(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bridge_client import BridgePage, main
+
+    monkeypatch.setenv("CHROME_BRIDGE_SCOPE", "task-from-env")
+    persistent_scope = BridgePage().scope_id
+
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "browse_open":
+            return {"result": {"tab_id": "3", "url": "u", "status": "ready"}}
+        if msg["method"] == "browse_close":
+            return {"result": {"closed": True, "confirmed": True}}
+        if msg["method"] == "close_owned_tabs":
+            return {"result": {"requested": 0, "confirmed": [], "pending": [], "refused": []}}
+        if msg["method"] == "list_tabs":
+            return {"result": []}
+        return {"result": "Title"}
+
+    with FakeRelay(responder) as relay:
+        assert main(["--bridge-url", relay.url, "--url", "https://x/", "eval", "1"]) == 0
+        capsys.readouterr()
+        cleanup_frames = [frame for frame in relay.frames if frame["method"] == "close_owned_tabs"]
+        assert cleanup_frames
+        assert all(frame["scope_id"] != persistent_scope for frame in cleanup_frames)
+
+
+def test_cli_cleans_temp_scope_when_command_raises_a_non_bridge_error() -> None:
+    from bridge_client import main
+
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "browse_open":
+            return {"result": {"tab_id": "3", "url": "u", "status": "ready"}}
+        if msg["method"] == "page_fetch":
+            return {
+                "result": {
+                    "status": 200,
+                    "ok": True,
+                    "url": "u",
+                    "length": 8,
+                    "body": "not-json",
+                }
+            }
+        if msg["method"] == "browse_close":
+            return {"result": {"closed": True, "confirmed": True}}
+        if msg["method"] == "close_owned_tabs":
+            return {"result": {"requested": 0, "confirmed": [], "pending": [], "refused": []}}
+        if msg["method"] == "list_tabs":
+            return {"result": []}
+        return {"result": None}
+
+    with FakeRelay(responder) as relay, pytest.raises(json.JSONDecodeError):
+        main(
+            [
+                "--bridge-url",
+                relay.url,
+                "--url",
+                "https://x/",
+                "fetch",
+                "https://x/api",
+                "--json",
+            ]
+        )
+    methods = [frame["method"] for frame in relay.frames]
+    assert "browse_close" in methods
+    assert "close_owned_tabs" in methods
+
+
+def test_cli_returns_nonzero_when_one_shot_cleanup_fails(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from bridge_client import main
+
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "browse_open":
+            return {"result": {"tab_id": "3", "url": "u", "status": "ready"}}
+        if msg["method"] == "browse_close":
+            return {"error": {"code": "TAB_CLOSE_FAILED", "message": "refused"}}
+        if msg["method"] == "close_owned_tabs":
+            return {
+                "result": {
+                    "requested": 1,
+                    "confirmed": [],
+                    "pending": [],
+                    "refused": [{"tab_id": "3", "error": "refused"}],
+                }
+            }
+        if msg["method"] == "list_tabs":
+            return {
+                "result": [{"tab_id": "3", "bridge_owned": True, "bridge_owned_by_scope": True}]
+            }
+        return {"result": "Title"}
+
+    with FakeRelay(responder) as relay:
+        assert main(["--bridge-url", relay.url, "--url", "https://x/", "eval", "1"]) == 1
+        assert "TAB_CLEANUP_FAILED" in capsys.readouterr().err
+
+
+def test_cli_cleanup_targets_only_the_named_scope(capsys: pytest.CaptureFixture[str]) -> None:
+    from bridge_client import main
+
+    def responder(msg: dict) -> dict:
+        if msg["method"] == "close_owned_tabs":
+            return {"result": {"requested": 0, "pending": [], "refused": []}}
+        if msg["method"] == "list_tabs":
+            return {"result": []}
+        return {"result": None}
+
+    with FakeRelay(responder) as relay:
+        assert main(["--bridge-url", relay.url, "--scope", "task-a", "cleanup"]) == 0
+        capsys.readouterr()
+        assert [frame["method"] for frame in relay.frames] == ["close_owned_tabs", "list_tabs"]
+        assert len({frame["scope_id"] for frame in relay.frames}) == 1
 
 
 def test_cli_cookie_values_require_an_explicit_reveal_flag(

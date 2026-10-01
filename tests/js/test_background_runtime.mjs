@@ -14,11 +14,18 @@ async function harness(options = {}) {
   const cspUpdates = [];
   const storageWrites = [];
   const warnings = [];
+  const windowCreates = [];
+  const windowUpdates = [];
+  const windows = new Map([[1, { id: 1, type: "normal", state: "normal", focused: true }]]);
   let storedState = options.initialState ? plain(options.initialState) : null;
   let nextTabId = 1;
+  let nextWindowId = 2;
   let createCount = 0;
   let removeCount = 0;
   let onRemoved = async () => {};
+  let onCreated = () => {};
+  let onReplaced = () => {};
+  let onWindowRemoved = () => {};
 
   function tabOrThrow(id) {
     const tab = tabs.get(Number(id));
@@ -45,7 +52,11 @@ async function harness(options = {}) {
     debugger: {
       async attach() {},
       async detach() {},
-      async sendCommand() {},
+      async sendCommand(target, method, params) {
+        if (options.debuggerSendCommand) {
+          return await options.debuggerSendCommand({ target, method, params });
+        }
+      },
     },
     declarativeNetRequest: {
       async updateDynamicRules() {},
@@ -75,16 +86,18 @@ async function harness(options = {}) {
       },
     },
     tabs: {
-      async create() {
+      async create(params = {}) {
         createCount += 1;
         const tab = {
           id: nextTabId++,
-          url: "about:blank",
+          url: params.url || "about:blank",
           status: "complete",
-          windowId: 1,
-          active: false,
+          windowId: params.windowId ?? 1,
+          active: params.active ?? false,
+          ...(params.openerTabId == null ? {} : { openerTabId: params.openerTabId }),
         };
         tabs.set(tab.id, tab);
+        onCreated({ ...tab });
         return { ...tab };
       },
       async get(id) {
@@ -96,8 +109,21 @@ async function harness(options = {}) {
           onRemoved = listener;
         },
       },
-      async query() {
-        return [...tabs.values()].map((tab) => ({ ...tab }));
+      onCreated: {
+        addListener(listener) {
+          onCreated = listener;
+        },
+      },
+      onReplaced: {
+        addListener(listener) {
+          onReplaced = listener;
+        },
+      },
+      async query(query = {}) {
+        return [...tabs.values()]
+          .filter((tab) => query.windowId == null || tab.windowId === query.windowId)
+          .filter((tab) => query.active == null || tab.active === query.active)
+          .map((tab) => ({ ...tab }));
       },
       async remove(id) {
         removeCount += 1;
@@ -107,21 +133,82 @@ async function harness(options = {}) {
         tabOrThrow(id);
         await emitRemoved(id);
       },
+      async move(id, { windowId }) {
+        const tab = tabOrThrow(id);
+        const oldWindowId = tab.windowId;
+        tab.windowId = Number(windowId);
+        tab.active = false;
+        if (![...tabs.values()].some((candidate) => candidate.windowId === oldWindowId)) {
+          windows.delete(oldWindowId);
+          await onWindowRemoved(oldWindowId);
+        }
+        return { ...tab };
+      },
       async update(id, update) {
         if (options.update) return await options.update({ id, update, tabs, tabOrThrow });
         const tab = tabOrThrow(id);
+        if (update.active) {
+          for (const sibling of tabs.values()) {
+            if (sibling.windowId === tab.windowId) sibling.active = sibling.id === tab.id;
+          }
+        }
         Object.assign(tab, update, { status: "complete" });
         return { ...tab };
       },
     },
     windows: {
-      async create() {
-        throw new Error("unexpected windows.create");
+      async create(params = {}) {
+        if (options.windowCreate) {
+          return await options.windowCreate({ params, tabs, windows, tabOrThrow });
+        }
+        if (options.beforeWindowCreate) await options.beforeWindowCreate();
+        windowCreates.push(plain(params));
+        const window = {
+          id: nextWindowId++,
+          type: params.type || "normal",
+          state: params.state || "normal",
+          focused: params.focused ?? true,
+        };
+        if (window.focused) {
+          for (const existing of windows.values()) existing.focused = false;
+        }
+        windows.set(window.id, window);
+        createCount += 1;
+        const tab = {
+          id: nextTabId++,
+          url: params.url || "about:blank",
+          status: "complete",
+          windowId: window.id,
+          active: true,
+          ...(params.openerTabId == null ? {} : { openerTabId: params.openerTabId }),
+        };
+        tabs.set(tab.id, tab);
+        onCreated({ ...tab });
+        return { ...window, tabs: [{ ...tab }] };
+      },
+      async get(id) {
+        const window = windows.get(Number(id));
+        if (!window) throw new Error(`No window with id: ${id}.`);
+        return { ...window };
       },
       async getAll() {
-        return [{ id: 1 }];
+        return [...windows.values()].map((window) => ({ ...window }));
       },
-      async update() {},
+      async update(id, update) {
+        const window = windows.get(Number(id));
+        if (!window) throw new Error(`No window with id: ${id}.`);
+        windowUpdates.push({ id: Number(id), update: plain(update) });
+        if (update.focused) {
+          for (const existing of windows.values()) existing.focused = false;
+        }
+        Object.assign(window, update);
+        return { ...window };
+      },
+      onRemoved: {
+        addListener(listener) {
+          onWindowRemoved = listener;
+        },
+      },
     },
   };
 
@@ -153,10 +240,13 @@ async function harness(options = {}) {
   return {
     context,
     tabs,
+    windows,
     cookieCalls,
     cspUpdates,
     storageWrites,
     warnings,
+    windowCreates,
+    windowUpdates,
     emitRemoved,
     storedState: () => (storedState ? plain(storedState) : null),
     cspTabIds: () => {
@@ -164,6 +254,16 @@ async function harness(options = {}) {
       return last?.addRules?.[0]?.condition?.tabIds || [];
     },
     counts: () => ({ create: createCount, remove: removeCount }),
+    emitWindowRemoved: async (id) => {
+      windows.delete(Number(id));
+      await onWindowRemoved(Number(id));
+    },
+    emitReplaced: async (addedTab, removedTabId) => {
+      tabs.delete(Number(removedTabId));
+      tabs.set(Number(addedTab.id), { ...addedTab });
+      onReplaced(Number(addedTab.id), Number(removedTabId));
+      await nextTurn();
+    },
   };
 }
 
@@ -414,12 +514,15 @@ async function testImmediateCloseRefusalRestoresNamedRoute() {
     evaluate(state, `cmdBrowseClose({tab_id:"${opened.tab_id}"})`),
     /Chrome refused to close the tab/,
   );
-  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["dash", 1]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["legacy\u001fdash", 1]]);
   assert.deepEqual(state.cspTabIds(), [1]);
   assert.deepEqual(state.storedState(), {
-    managedTabId: null,
-    sessions: [["dash", 1]],
+    schemaVersion: 2,
+    managedTabs: [],
+    sessions: [["legacy", "dash", 1]],
     bridgeTabs: [1],
+    tabScopes: [[1, "legacy"]],
+    automationWindowId: 2,
   });
 }
 
@@ -443,8 +546,8 @@ async function testDelayedCloseRefusalRestoresNamedRoute() {
 
   removal.reject(new Error("Tabs cannot be edited right now"));
   await nextTurn();
-  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["dash", 1]]);
-  assert.deepEqual(state.storedState().sessions, [["dash", 1]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["legacy\u001fdash", 1]]);
+  assert.deepEqual(state.storedState().sessions, [["legacy", "dash", 1]]);
   assert.ok(state.warnings.some((warning) => warning.includes("tabs.remove refused")));
 }
 
@@ -494,9 +597,9 @@ async function testRefusalDoesNotOverwriteConcurrentNamedReplacement() {
   await nextTurn();
 
   assert.equal(replacement.tab_id, "2");
-  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["dash", 2]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["legacy\u001fdash", 2]]);
   assert.deepEqual(state.cspTabIds(), [1, 2]);
-  assert.deepEqual(state.storedState().sessions, [["dash", 2]]);
+  assert.deepEqual(state.storedState().sessions, [["legacy", "dash", 2]]);
 }
 
 async function testImmediateRefusalDoesNotWaitForFailingReplacement() {
@@ -556,14 +659,17 @@ async function testImmediateRefusalDoesNotWaitForFailingReplacement() {
 
   assert.equal(state.tabs.has(1), true);
   assert.equal(state.tabs.has(2), false);
-  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["dash", 1]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["legacy\u001fdash", 1]]);
   assert.deepEqual(plain(await evaluate(state, "[..._sessionOpenLocks]")), []);
   assert.deepEqual(plain(await evaluate(state, "[..._bridgeTabs]")), [1]);
   assert.deepEqual(state.cspTabIds(), [1]);
   assert.deepEqual(state.storedState(), {
-    managedTabId: null,
-    sessions: [["dash", 1]],
+    schemaVersion: 2,
+    managedTabs: [],
+    sessions: [["legacy", "dash", 1]],
     bridgeTabs: [1],
+    tabScopes: [[1, "legacy"]],
+    automationWindowId: 2,
   });
 }
 
@@ -584,27 +690,19 @@ async function testNavigateUsesOneDeadlineAcrossStartupAndLoad() {
   );
 }
 
-async function testNewBackgroundTabFallsBackToAnExistingWindow() {
+async function testNewBackgroundTabUsesDedicatedMinimizedWindow() {
   const state = await harness();
-  await evaluate(
-    state,
-    `globalThis.createArgs = [];
-     const realCreate = chrome.tabs.create.bind(chrome.tabs);
-     chrome.tabs.create = async (params) => {
-       globalThis.createArgs.push(params);
-       if (globalThis.createArgs.length === 1) throw new Error("No current window");
-       return await realCreate(params);
-     };
-     chrome.windows.getAll = async () => [{id: 7}];`,
-  );
+  const first = await evaluate(state, "newBackgroundTab()");
+  const second = await evaluate(state, "newBackgroundTab()");
 
-  const tab = await evaluate(state, "newBackgroundTab()");
-  const createArgs = plain(await evaluate(state, "globalThis.createArgs"));
-  assert.equal(tab.id, 1);
-  assert.deepEqual(createArgs, [
-    { url: "about:blank", active: false },
-    { url: "about:blank", active: false, windowId: 7 },
+  assert.equal(first.windowId, 2);
+  assert.equal(second.windowId, 2);
+  assert.deepEqual(state.windowCreates, [
+    { url: "about:blank", type: "normal", focused: false, state: "minimized" },
   ]);
+  assert.equal(state.windows.get(1).focused, true);
+  assert.equal(state.windows.get(2).focused, false);
+  assert.equal(state.windows.get(2).state, "minimized");
 }
 
 async function testNamedSessionRecoversOnlyAfterItsTabVanishes() {
@@ -635,7 +733,7 @@ async function testNamedSessionRecoversOnlyAfterItsTabVanishes() {
   assert.equal(recovered.tab_id, "2");
   assert.equal(recovered.status, "ready");
   assert.deepEqual(state.counts(), { create: 2, remove: 0 });
-  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["dash", 2]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["legacy\u001fdash", 2]]);
 }
 
 async function testSameUrlNamedReuseRecoversIfTabVanishesBeforeReturn() {
@@ -662,7 +760,7 @@ async function testSameUrlNamedReuseRecoversIfTabVanishesBeforeReturn() {
   assert.equal(first.tab_id, "1");
   assert.equal(recovered.tab_id, "2");
   assert.equal(recovered.status, "ready");
-  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["dash", 2]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["legacy\u001fdash", 2]]);
 }
 
 async function testConcurrentSameNameOpenCreatesOneTab() {
@@ -700,7 +798,7 @@ async function testConcurrentSameNameOpenCreatesOneTab() {
   assert.deepEqual(state.counts(), { create: 1, remove: 0 });
   assert.deepEqual(plain(await evaluate(state, "[..._bridgeTabs]")), [1]);
   assert.deepEqual(state.cspTabIds(), [1]);
-  assert.deepEqual(state.storedState().sessions, [["dash", 1]]);
+  assert.deepEqual(state.storedState().sessions, [["legacy", "dash", 1]]);
   assert.deepEqual(plain(await evaluate(state, "[..._sessionOpenLocks]")), []);
 }
 
@@ -814,14 +912,17 @@ async function testPendingNamedCloseReopensWithoutReusingDoomedTab() {
     'cmdBrowseOpen({url:"https://two.example", name:"dash", timeout:1000, settle_ms:0})',
   );
   assert.equal(reopened.tab_id, "2");
-  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["dash", 2]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [["legacy\u001fdash", 2]]);
   assert.deepEqual(state.cspTabIds(), [1, 2]);
   const closed = await closing;
   assert.equal(closed.confirmed, null);
   assert.deepEqual(state.storedState(), {
-    managedTabId: null,
-    sessions: [["dash", 2]],
+    schemaVersion: 2,
+    managedTabs: [],
+    sessions: [["legacy", "dash", 2]],
     bridgeTabs: [1, 2],
+    tabScopes: [[1, "legacy"], [2, "legacy"]],
+    automationWindowId: 2,
   });
 
   await state.emitRemoved(1);
@@ -830,10 +931,346 @@ async function testPendingNamedCloseReopensWithoutReusingDoomedTab() {
   assert.deepEqual(plain(await evaluate(state, "[..._bridgeTabs]")), [2]);
   assert.deepEqual(state.cspTabIds(), [2]);
   assert.deepEqual(state.storedState(), {
-    managedTabId: null,
-    sessions: [["dash", 2]],
+    schemaVersion: 2,
+    managedTabs: [],
+    sessions: [["legacy", "dash", 2]],
     bridgeTabs: [2],
+    tabScopes: [[2, "legacy"]],
+    automationWindowId: 2,
   });
+}
+
+async function testScopesIsolateManagedTabsAndNamedSessions() {
+  const state = await harness();
+  const managedA = await evaluate(state, 'getOrOpenManagedTab("scope-a")');
+  const managedB = await evaluate(state, 'getOrOpenManagedTab("scope-b")');
+  assert.notEqual(managedA.id, managedB.id);
+  assert.deepEqual(plain(await evaluate(state, "[..._managedTabs.entries()]")), [
+    ["scope-a", managedA.id],
+    ["scope-b", managedB.id],
+  ]);
+
+  const namedA = await evaluate(
+    state,
+    'cmdBrowseOpen({url:"https://one.example", name:"dash", scope_id:"scope-a", timeout:1000, settle_ms:0})',
+  );
+  const namedB = await evaluate(
+    state,
+    'cmdBrowseOpen({url:"https://two.example", name:"dash", scope_id:"scope-b", timeout:1000, settle_ms:0})',
+  );
+  assert.notEqual(namedA.tab_id, namedB.tab_id);
+  assert.deepEqual(plain(await evaluate(state, 'listSessions("scope-a")')), [
+    { name: "dash", tab_id: namedA.tab_id },
+  ]);
+  assert.deepEqual(plain(await evaluate(state, 'listSessions("scope-b")')), [
+    { name: "dash", tab_id: namedB.tab_id },
+  ]);
+}
+
+async function testNumericSessionNamesAreRejected() {
+  const state = await harness();
+  await assert.rejects(
+    evaluate(
+      state,
+      'cmdBrowseOpen({url:"about:blank", name:"123", scope_id:"scope-a", timeout:1000, settle_ms:0})',
+    ),
+    (error) => error.bridge.code === "BAD_REQUEST",
+  );
+  assert.equal(state.tabs.size, 0);
+}
+
+async function testLegacyStateHydratesIntoTheReservedScope() {
+  const state = await harness({
+    initialState: {
+      managedTabId: 7,
+      sessions: [["dash", 8]],
+      bridgeTabs: [7, 8],
+      automationWindowId: 2,
+    },
+  });
+  assert.deepEqual(plain(await evaluate(state, "[..._managedTabs.entries()]")), [["legacy", 7]]);
+  assert.deepEqual(plain(await evaluate(state, "[..._sessions.entries()]")), [
+    ["legacy\u001fdash", 8],
+  ]);
+  assert.deepEqual(plain(await evaluate(state, "[..._tabScopes.entries()]")), [
+    [7, "legacy"],
+    [8, "legacy"],
+  ]);
+}
+
+async function testScopedCleanupPreservesUserAndOtherScopeTabs() {
+  const state = await harness();
+  const userTab = await evaluate(
+    state,
+    'chrome.tabs.create({url:"https://user.example", active:true, windowId:1})',
+  );
+  const tabA = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  const tabB = await evaluate(state, 'createBridgeTab("about:blank", "scope-b")');
+
+  const result = plain(await evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})'));
+  assert.deepEqual(result.confirmed, [String(tabA.id)]);
+  assert.deepEqual(result.refused, []);
+  assert.equal(state.tabs.has(tabA.id), false);
+  assert.equal(state.tabs.has(tabB.id), true);
+  assert.equal(state.tabs.has(userTab.id), true);
+  assert.deepEqual(plain(await evaluate(state, "[..._bridgeTabs]")), [tabB.id]);
+}
+
+async function testCleanupNeverClosesAUserWindow() {
+  const state = await harness();
+  const owned = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  await evaluate(state, `chrome.tabs.move(${owned.id}, {windowId:1, index:-1})`);
+
+  const protectedResult = plain(
+    await evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})'),
+  );
+  assert.equal(protectedResult.refused.length, 1);
+  assert.match(protectedResult.refused[0].error, /tab from a user or foreground window/);
+  assert.equal(state.windows.has(1), true);
+  assert.equal(state.tabs.has(owned.id), true);
+
+  const userTab = await evaluate(
+    state,
+    'chrome.tabs.create({url:"https://user.example", active:true, windowId:1})',
+  );
+  const stillProtected = plain(await evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})'));
+  assert.equal(stillProtected.refused.length, 1);
+  assert.equal(state.tabs.has(owned.id), true);
+  assert.equal(state.tabs.has(userTab.id), true);
+  assert.equal(state.windows.has(1), true);
+}
+
+async function testCleanupWaitsForAnInflightCreate() {
+  const windowGate = deferred();
+  const state = await harness({ beforeWindowCreate: () => windowGate.promise });
+  const opening = evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  await nextTurn();
+
+  let cleanupSettled = false;
+  const cleanup = evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})').finally(() => {
+    cleanupSettled = true;
+  });
+  await nextTurn();
+  assert.equal(cleanupSettled, false, "cleanup returned while a scope create was in flight");
+
+  windowGate.resolve();
+  await assert.rejects(opening, (error) => error.bridge.code === "SCOPE_CLOSING");
+  const result = plain(await cleanup);
+  assert.deepEqual(result.remaining, []);
+  assert.deepEqual(plain(await evaluate(state, "[..._bridgeTabs]")), []);
+}
+
+async function testCleanupWaitsForTheWholeBrowseOpenLifecycle() {
+  const selectorGate = deferred();
+  const state = await harness();
+  state.context.selectorGate = selectorGate.promise;
+  await evaluate(
+    state,
+    "waitForSelector = async () => { await globalThis.selectorGate; return true; }",
+  );
+  const opening = evaluate(
+    state,
+    'cmdBrowseOpen({url:"about:blank", wait_selector:"#ready", scope_id:"scope-a", timeout:1000, settle_ms:0})',
+  );
+  while (state.tabs.size === 0) await nextTurn();
+
+  let cleanupSettled = false;
+  const cleanup = evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})').finally(() => {
+    cleanupSettled = true;
+  });
+  await nextTurn();
+  assert.equal(cleanupSettled, false, "cleanup returned before browse_open settled");
+
+  selectorGate.resolve();
+  await assert.rejects(
+    opening,
+    (error) => error.bridge?.code === "SCOPE_CLOSING" || /No tab with id/.test(error.message),
+  );
+  const result = plain(await cleanup);
+  assert.deepEqual(result.remaining, []);
+  assert.deepEqual(plain(await evaluate(state, "[..._bridgeTabs]")), []);
+}
+
+async function testDelayedChildIsDiscardedWhileParentCloseIsPending() {
+  const parentRemoval = deferred();
+  let parentId = null;
+  const state = await harness({
+    setTimeout(callback) {
+      return setTimeout(callback, 0);
+    },
+    async remove({ id, emitRemoved }) {
+      if (id === parentId) {
+        await parentRemoval.promise;
+      }
+      await emitRemoved(id);
+    },
+  });
+  const parent = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  parentId = parent.id;
+
+  const result = plain(await evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})'));
+  assert.deepEqual(result.pending, [String(parent.id)]);
+  const child = await evaluate(
+    state,
+    `chrome.tabs.create({url:"https://child.example", active:false, windowId:${parent.windowId}, openerTabId:${parent.id}})`,
+  );
+  await nextTurn();
+  await nextTurn();
+  assert.equal(state.tabs.has(child.id), false, "late child escaped draining cleanup");
+  await assert.rejects(
+    evaluate(state, 'createBridgeTab("about:blank", "scope-a")'),
+    (error) => error.bridge.code === "SCOPE_CLOSING",
+  );
+
+  parentRemoval.resolve();
+  await nextTurn();
+  await nextTurn();
+  const reopened = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  assert.equal(state.tabs.has(reopened.id), true);
+}
+
+async function testCloseRejectsUserTabsAndOtherScopes() {
+  const state = await harness();
+  const userTab = await evaluate(
+    state,
+    'chrome.tabs.create({url:"https://user.example", active:true, windowId:1})',
+  );
+  const tabB = await evaluate(state, 'createBridgeTab("about:blank", "scope-b")');
+
+  await assert.rejects(
+    evaluate(state, `cmdBrowseClose({tab_id:"${userTab.id}", scope_id:"scope-a"})`),
+    (error) => error.bridge.code === "TAB_NOT_OWNED",
+  );
+  await assert.rejects(
+    evaluate(state, `cmdBrowseClose({tab_id:"${tabB.id}", scope_id:"scope-a"})`),
+    (error) => error.bridge.code === "TAB_SCOPE_MISMATCH",
+  );
+  assert.equal(state.tabs.has(userTab.id), true);
+  assert.equal(state.tabs.has(tabB.id), true);
+}
+
+async function testOtherScopesCannotTargetOwnedTabs() {
+  const state = await harness();
+  const userTab = await evaluate(
+    state,
+    'chrome.tabs.create({url:"https://user.example", active:true, windowId:1})',
+  );
+  const tabB = await evaluate(state, 'createBridgeTab("about:blank", "scope-b")');
+
+  await assert.rejects(
+    evaluate(state, `resolveTab({tab_id:"${tabB.id}", scope_id:"scope-a"})`),
+    (error) => error.bridge.code === "TAB_SCOPE_MISMATCH",
+  );
+  const attachedUserTab = await evaluate(
+    state,
+    `resolveTab({tab_id:"${userTab.id}", scope_id:"scope-a"})`,
+  );
+  assert.equal(attachedUserTab.id, userTab.id);
+}
+
+async function testChildTabsInheritScopeAndCleanup() {
+  const state = await harness();
+  const parent = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  const child = await evaluate(
+    state,
+    `chrome.tabs.create({url:"https://child.example", active:false, windowId:${parent.windowId}, openerTabId:${parent.id}})`,
+  );
+  await nextTurn();
+  assert.equal(await evaluate(state, `_tabScopes.get(${child.id})`), "scope-a");
+
+  await evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})');
+  assert.equal(state.tabs.has(parent.id), false);
+  assert.equal(state.tabs.has(child.id), false);
+}
+
+async function testPopupChildIsRehomedIntoTheMinimizedAutomationWindow() {
+  const state = await harness();
+  const parent = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  const popup = await evaluate(
+    state,
+    `chrome.windows.create({url:"https://popup.example", state:"normal", focused:true, openerTabId:${parent.id}})`,
+  );
+  const childId = popup.tabs[0].id;
+  const popupWindowId = popup.id;
+  await nextTurn();
+  await nextTurn();
+
+  assert.equal(state.tabs.get(childId).windowId, parent.windowId);
+  assert.equal(state.windows.has(popupWindowId), false);
+  assert.equal(state.windows.get(parent.windowId).state, "minimized");
+  assert.equal(state.windows.get(parent.windowId).focused, false);
+}
+
+async function testTabReplacementTransfersOwnershipAndRoutes() {
+  const state = await harness();
+  const original = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  await evaluate(
+    state,
+    `_managedTabs.set("scope-a", ${original.id}); _sessions.set(sessionKey("scope-a", "dash"), ${original.id})`,
+  );
+  const replacement = { ...original, id: 99, url: "https://replacement.example" };
+  await state.emitReplaced(replacement, original.id);
+
+  assert.equal(await evaluate(state, '_managedTabs.get("scope-a")'), 99);
+  assert.equal(await evaluate(state, '_sessions.get(sessionKey("scope-a", "dash"))'), 99);
+  assert.deepEqual(plain(await evaluate(state, "[..._bridgeTabs]")), [99]);
+  assert.equal(await evaluate(state, "_tabScopes.get(99)"), "scope-a");
+  await evaluate(state, 'cmdCloseOwnedTabs({scope_id:"scope-a"})');
+  assert.equal(state.tabs.has(99), false);
+}
+
+async function testForegroundingFailsClosedByDefault() {
+  const state = await harness();
+  const tab = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+
+  await assert.rejects(
+    evaluate(
+      state,
+      `cmdCdpMouse({action:"click", x:1, y:1, tab_id:"${tab.id}", scope_id:"scope-a"})`,
+    ),
+    (error) => error.bridge.code === "FOREGROUND_REQUIRED",
+  );
+  await assert.rejects(
+    evaluate(state, `cmdActivateTab({tab_id:"${tab.id}", scope_id:"scope-a"})`),
+    (error) => error.bridge.code === "FOREGROUND_REQUIRED",
+  );
+  assert.equal(state.windowUpdates.some(({ update }) => update.focused === true), false);
+  assert.equal(state.windows.get(1).focused, true);
+}
+
+async function testForegroundTrustedInputHoldsTheAutomationWindowLock() {
+  const pressStarted = deferred();
+  const releasePress = deferred();
+  const state = await harness({
+    async debuggerSendCommand({ method, params }) {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+        pressStarted.resolve();
+        await releasePress.promise;
+      }
+    },
+  });
+  const tab = await evaluate(state, 'createBridgeTab("about:blank", "scope-a")');
+  state.windows.get(tab.windowId).state = "normal";
+  state.windows.get(tab.windowId).focused = true;
+  state.windows.get(1).focused = false;
+
+  const clicking = evaluate(
+    state,
+    `cmdCdpMouse({action:"click", x:1, y:1, tab_id:"${tab.id}", scope_id:"scope-a"})`,
+  );
+  await pressStarted.promise;
+  let openSettled = false;
+  const opening = evaluate(state, 'createBridgeTab("about:blank", "scope-b")').finally(() => {
+    openSettled = true;
+  });
+  await nextTurn();
+  assert.equal(openSettled, false, "tab creation minimized the window during trusted input");
+  assert.equal(state.windows.get(tab.windowId).state, "normal");
+
+  releasePress.resolve();
+  await clicking;
+  await opening;
+  assert.equal(state.windows.get(tab.windowId).state, "minimized");
 }
 
 async function testCookieScopeIsStrictAndExplicit() {
@@ -873,11 +1310,26 @@ await testDelayedCloseRefusalRestoresNamedRoute();
 await testRefusalDoesNotOverwriteConcurrentNamedReplacement();
 await testImmediateRefusalDoesNotWaitForFailingReplacement();
 await testNavigateUsesOneDeadlineAcrossStartupAndLoad();
-await testNewBackgroundTabFallsBackToAnExistingWindow();
+await testNewBackgroundTabUsesDedicatedMinimizedWindow();
 await testNamedSessionRecoversOnlyAfterItsTabVanishes();
 await testSameUrlNamedReuseRecoversIfTabVanishesBeforeReturn();
 await testConcurrentSameNameOpenCreatesOneTab();
 await testTimedOutNamedWaiterPreservesFifoOrder();
 await testNamedReuseSharesTheOpenDeadline();
 await testPendingNamedCloseReopensWithoutReusingDoomedTab();
+await testScopesIsolateManagedTabsAndNamedSessions();
+await testNumericSessionNamesAreRejected();
+await testLegacyStateHydratesIntoTheReservedScope();
+await testScopedCleanupPreservesUserAndOtherScopeTabs();
+await testCleanupNeverClosesAUserWindow();
+await testCleanupWaitsForAnInflightCreate();
+await testCleanupWaitsForTheWholeBrowseOpenLifecycle();
+await testDelayedChildIsDiscardedWhileParentCloseIsPending();
+await testCloseRejectsUserTabsAndOtherScopes();
+await testOtherScopesCannotTargetOwnedTabs();
+await testChildTabsInheritScopeAndCleanup();
+await testPopupChildIsRehomedIntoTheMinimizedAutomationWindow();
+await testTabReplacementTransfersOwnershipAndRoutes();
+await testForegroundingFailsClosedByDefault();
+await testForegroundTrustedInputHoldsTheAutomationWindowLock();
 await testCookieScopeIsStrictAndExplicit();

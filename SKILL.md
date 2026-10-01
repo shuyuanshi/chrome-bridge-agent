@@ -3,7 +3,7 @@ name: chrome-bridge-agent
 description: Drive the user's real Chrome with existing logins, cookies, extensions, and SPA state. Use when the host's native browser cannot access the required signed-in Chrome profile, when the user explicitly requests Chrome Bridge, or for logged-in pages, multi-step SPAs, cookie-backed APIs, and sites that block headless browsers. Do not use for public-page research that does not need the user's Chrome state.
 license: MIT
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
   homepage: "https://github.com/shuyuanshi/chrome-bridge-agent"
 ---
 
@@ -40,6 +40,37 @@ Chrome installed and one manual extension install.
   and specific approval for that action.
 - Never start the relay with `--no-auth`. The normal token and Origin checks are
   required even though the relay listens only on localhost.
+
+## Browser coexistence and cleanup
+
+- The extension acts only in the Chrome profile where it is installed; a
+  command cannot select another profile. Bridge-created tabs live in one
+  minimized, unfocused automation window in that profile, never in the user's
+  current window. For OS-level isolation, install the extension in a dedicated
+  Chrome profile and sign that profile into the required sites. Keep only one
+  extension/profile connected to this relay.
+- Wrap the whole investigation in `with BridgePage() as page:`. Each page gets
+  an opaque ownership scope; its managed tab, named sessions, and cleanup are
+  isolated from parallel agents. Never share a `scope_id` or
+  `CHROME_BRIDGE_SCOPE` value between concurrent agents.
+- Inside that task scope, open one anonymous `page.tab(...)` and reuse it via
+  `navigate()` rather than accumulating tabs. The outer context calls
+  `close_owned_tabs()` on success or error; use an explicit `try/finally` with
+  `close_owned_tabs()` when an outer context is impractical.
+- Do not use a named session merely for convenience. It intentionally survives
+  the inner `Tab` context and is appropriate only for continuity across calls;
+  it still closes when the outer task scope exits. Cross-process CLI sessions
+  require the same explicit `--scope`, followed by `cleanup --scope ...`.
+- `close_owned_tabs()` and `browse_close()` close only tabs created by their
+  own scope. They refuse user tabs and tabs owned by another agent. Cleanup
+  never closes a window directly; if an owned tab is moved out of the
+  automation window, automatic cleanup refuses to remove it at all. This
+  avoids any race that could implicitly close a user window. Never bulk close
+  by URL, title, window, or an unscoped list of tab IDs.
+- Ordinary DOM work stays in the background. `activate_tab()` and trusted CDP
+  click/drag require an explicit foreground opt-in and can interrupt whatever
+  application the user is using. Prefer `click_element()` / `act()`; if trusted
+  input is essential, pause and get permission before opting in.
 
 ## Runtime setup
 
@@ -92,8 +123,8 @@ Python script  ─►  bridge_client.BridgePage / Tab
 
 ```bash
 chrome-bridge status
-# {"extension_connected": true, "extension_version": "2.0.0", "pending": 0,
-#  "server_version": "2.0.0"}
+# {"extension_connected": true, "extension_version": "2.1.0", "pending": 0,
+#  "server_version": "2.1.0"}
 ```
 
 If `extension_version` is missing or below the server version, Chrome is still
@@ -138,16 +169,24 @@ session-scoped verbs would quietly act on the shared managed tab.
 
 ```bash
 chrome-bridge eval 'document.title' --url https://example.com
-chrome-bridge snapshot --session dash    # numbered elements
+chrome-bridge snapshot --url https://example.com  # numbered elements, auto-cleaned
 chrome-bridge text --url https://x.com/y # innerText, chunked
-chrome-bridge fetch https://internal/api/x --json
-chrome-bridge screenshot --selector "#chart" --out chart.png
+chrome-bridge fetch https://internal/api/x --url https://internal --json
+chrome-bridge screenshot --url https://example.com --selector "#chart" --out chart.png
 chrome-bridge list-tabs
 chrome-bridge reload                     # after editing extension/
+
+# Only when continuity across processes is required:
+chrome-bridge --scope dashboard-task --url https://example.com --session dash snapshot
+chrome-bridge --scope dashboard-task --session dash text
+chrome-bridge --scope dashboard-task cleanup
 ```
 
-`--url` opens a temp tab and closes it; `--session NAME` keeps a named tab
-alive across calls; `--tab-id N` targets a tab the user already has open.
+An anonymous `--url` opens in its own transient scope and cleans that scope,
+even if another `--scope` was supplied; this preserves that scope's existing
+named sessions. `--session NAME` keeps a named tab alive across calls and requires `--scope` (or a unique
+`CHROME_BRIDGE_SCOPE`); `cleanup` closes every tab in that scope. `--tab-id N`
+targets an existing tab but does not make it safe to close.
 The console command is installed by `uv sync` or `pip install -e .`.
 
 ## Python API
@@ -157,21 +196,21 @@ The console command is installed by `uv sync` or `pip install -e .`.
 ```python
 from bridge_client import BridgePage
 
-page = BridgePage()
-
-with page.tab("https://internal.dashboard/x") as tab:      # closed on exit
-    tab.click_element("#filter")
-    tab.wait_for_element(".results-row", timeout=20)
-    rows = tab.evaluate("document.querySelectorAll('.results-row').length")
+with BridgePage() as page:                                # scoped task cleanup
+    with page.tab("https://internal.dashboard/x") as tab:  # closed on inner exit
+        tab.click_element("#filter")
+        tab.wait_for_element(".results-row", timeout=20)
+        rows = tab.evaluate("document.querySelectorAll('.results-row').length")
 ```
 
 `tab()` returns a `Tab`, which **is** a `BridgePage` bound to that tab — every
 verb below targets it. An anonymous tab is closed when the block exits.
 
-Pass `name="dash"` to reuse the same tab across runs instead of opening a new one
-each time. A **named** tab is deliberately left open when the block exits;
-`list_sessions()` lists them and `tab.close()` / `browse_close(tab_id)` disposes
-of one.
+Pass `name="dash"` only when a tab must survive the inner block. A **named** tab
+is left open by `Tab.__exit__`, but the outer `BridgePage` context still closes
+it with the rest of that scope. `list_sessions()` lists only the current
+scope; `tab.close()` / `browse_close(tab_id)` disposes of one, and
+`close_owned_tabs()` disposes of all tabs in the scope.
 
 To drive a tab the *user* already has open:
 
@@ -249,26 +288,23 @@ title = page.browse_and_eval("https://example.com", "document.title", timeout=30
 | Input | `press_key` `type_text` `mouse_move` `mouse_click` `dispatch_wheel_event` `cdp_mouse` |
 | Files | `set_file_input` |
 | Capture | `screenshot` `screenshot_element` `get_cookies` |
-| Sessions | `tab` `list_tabs` `list_sessions` `activate_tab` `browse_open` `browse_do` `browse_close` `browse_and_eval` |
+| Sessions | `tab` `list_tabs` `list_sessions` `close_owned_tabs` `activate_tab` `browse_open` `browse_do` `browse_close` `browse_and_eval` |
+| Health | `status` `is_server_running` `is_extension_connected` `reload_self` |
 
 `browse_close` returns as soon as the close is *issued* — Chrome reaps the
 tab on its own schedule (usually instant, but a queue of removals or an
 unfocused window can stretch it past a minute). `confirmed` in the reply is
 `True` when Chrome had already finished, `None` when it hadn't yet.
-| Health | `status` `is_server_running` `is_extension_connected` `reload_self` |
-
 `cdp_mouse(action, x, y, x2, y2)` sends **trusted** native input via CDP —
 reach for it when synthetic events are ignored (native context menus, HTML5
 drag-and-drop, widgets that check `event.isTrusted`).
 
-> **This is the one verb that touches the foreground.** Chrome always delivers
-> CDP pointer *moves* to a background tab, but press/release only arrive while
-> that tab's renderer still has a live surface — so a click on a tab that has
-> been in the background for a while silently goes nowhere. The tab is
-> therefore raised for the duration and the user's tab is restored afterwards
-> (a sub-second flash). `activate=False` opts out, at that risk.
-> `activate_tab()` exposes the same move on its own, and returns the tab it
-> displaced so you can put it back.
+Chrome delivers CDP pointer *moves* in the background, but trusted press/release
+needs a foreground surface. Click/drag therefore raises
+`ForegroundRequiredError` by default. `activate=True` and
+`activate_tab(allow_foreground=True)` are explicit foreground opt-ins; use them
+only after the user agrees, because an extension cannot reliably restore a
+different application's macOS focus.
 
 ### Errors are typed — branch on them, don't grep the message
 
@@ -301,9 +337,10 @@ except TabGoneError:
 - **Long-running JS exceeds the call deadline.** Drive loops from Python (one
   call per iteration), not `for (...) setTimeout(...)` inside one `evaluate`.
   Deadlines are per-call and derived from the timeout you pass.
-- **The managed tab is shared.** Verbs called on `BridgePage` (not on a `Tab`)
-  all target one background tab, so two concurrent scripts clobber each other.
-  Use `page.tab(...)` — a session per script — and this disappears.
+- **The managed tab is scope-local, not operation-local.** Separate
+  `BridgePage` instances isolate parallel agents, but concurrent unbound verbs
+  on the same page still share its managed tab. Use one bound `page.tab(...)`
+  per concurrent flow.
 - **`:contains()` is jQuery, not CSS.** Read `read_text()` and filter in Python.
 - **JSON from JS must be `json.loads`-ed**, not `eval`-ed (`true`/`null`).
 - **Vue/React comboboxes often hide a real `<select>`.** `select_option` on the

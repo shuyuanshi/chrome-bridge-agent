@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Bridge",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Bridge between a local Python client and Chrome — browser automation that reuses your real, signed-in profile.",
   "permissions": [
     "tabs",

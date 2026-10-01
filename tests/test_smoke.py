@@ -46,6 +46,7 @@ PUBLIC_API = {
     "fetch_json",
     # element interactions
     "click_element",
+    "close_owned_tabs",
     "input_text",
     "input_content_editable",
     "select_option",

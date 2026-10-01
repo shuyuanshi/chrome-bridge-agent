@@ -1,67 +1,61 @@
-# Bridge Runs in the Background (2026-05-16)
+# Background Windows, Scoped Runs, and Focus Safety
 
-## Problem
+Chrome Bridge v2.1 separates automation from the user's live browsing at three
+layers.
 
-Chrome Bridge used to steal focus:
+## Dedicated automation window
 
-1. `browse_open` opened new tabs with `active: true`, so Chrome switched
-   the user's view to the new tab.
-2. `getOrOpenManagedTab` reused the user's *active* tab, so the page the
-   user was looking at was navigated out from under them.
+Every bridge-created tab is placed in one same-profile Chrome window created
+with `focused: false` and `state: "minimized"`. Subsequent tabs always specify
+that window's ID; the extension never lets `chrome.tabs.create()` default to
+the user's current window.
 
-## Fix
+The profile is selected by where the extension is installed. Chrome extension
+APIs cannot switch profiles per command. Install the extension in a dedicated
+profile when OS-level separation is more important than sharing the user's
+existing cookies and login state.
 
-### `cmdBrowseOpen` — used by `browse_open` / `browse_do` / `browse_close`
+## Ownership scopes
 
-`extension/background.js`: `active: true` → `active: false`.
+Each `BridgePage` sends an opaque `scope_id`. The extension namespaces managed
+tabs and named sessions by that scope and records `tab_id -> scope_id` for every
+tab it creates. Tabs opened with `window.open` or `target=_blank` inherit the
+scope of their bridge-owned opener when Chrome exposes `openerTabId`.
 
-```diff
--async function cmdBrowseOpen({ url, timeout = 60000 }) {
--  const tab = await chrome.tabs.create({ url, active: true });
-+async function cmdBrowseOpen({ url, timeout = 60000 }) {
-+  const tab = await chrome.tabs.create({ url, active: false });
+`close_owned_tabs()` removes only the caller's tabs. `browse_close()` refuses
+both user-owned tabs and tabs owned by another scope. This makes task cleanup
+safe while multiple agents share the extension.
+
+Cleanup never calls `chrome.windows.remove()`. It refuses to remove any owned
+tab after that tab leaves the automation window, avoiding even a last-tab race
+that could make Chrome close a user window implicitly. Only the unfocused
+automation window may disappear when its final owned tab closes.
+
+Wrap a task in an outer context so cleanup happens on success and failure:
+
+```python
+from bridge_client import BridgePage
+
+with BridgePage() as page:
+    with page.tab("https://example.com") as tab:
+        print(tab.snapshot_text())
 ```
 
-### `getOrOpenManagedTab` — used by `navigate` / `evaluate`
+## Foreground-required input
 
-`extension/background.js`: rewritten to keep one persistent background tab
-instead of hijacking the user's active tab.
+DOM actions, page evaluation, snapshots, fetches, and CDP pointer moves remain
+background-only. Chrome may drop trusted CDP press/release events when the
+target renderer has no live foreground surface. `cdp_mouse()` click/drag
+therefore raises `FOREGROUND_REQUIRED` by default instead of focusing Chrome.
 
-```diff
--async function getOrOpenManagedTab() {
--  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
--  if (activeTab && /* …scriptable… */ ) return activeTab;
--  const tabs = await chrome.tabs.query({});
--  …
--  const tab = await chrome.tabs.create({ url: "about:blank" });
-+async function getOrOpenManagedTab() {
-+  if (_managedTabId) {
-+    try {
-+      const existing = await chrome.tabs.get(_managedTabId);
-+      if (existing) return existing;
-+    } catch (e) { /* tab was closed; fall through */ }
-+  }
-+  const tab = await chrome.tabs.create({ url: "about:blank", active: false });
-+  _managedTabId = tab.id;
-```
+`cdp_mouse(..., activate=True)` and
+`activate_tab(allow_foreground=True)` are deliberate opt-ins. They may bring
+Chrome in front of another macOS application, which an extension cannot
+reliably restore; obtain the user's permission first.
 
-Plus a new module-level variable:
+## Activating extension changes
 
-```js
-let _managedTabId = null;  // persistent background tab ID
-```
-
-## Activating the fix
-
-1. Reload the extension manually once in `chrome://extensions` (click the
-   ↻ button on the extension card).
-2. After that, `bridge_server`'s auto-reload picks up future changes.
-
-## Side-effect: race conditions
-
-Because the managed tab is shared and persistent, two scripts that both
-call `navigate()` will race — the second `navigate()` clobbers the page
-the first one was about to read. Either serialise dependent scripts at
-the scheduler layer, or have each script verify
-`window.location.hostname` before extracting and re-navigate (or
-`raise RuntimeError`) on mismatch.
+Run `chrome-bridge reload`. If the connected service worker is too old to
+receive that command, open `chrome://extensions` and click the reload button on
+the Chrome Bridge card. Reinstalling is unnecessary when the unpacked extension
+already points at this repository's `extension/` directory.

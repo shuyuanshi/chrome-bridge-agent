@@ -1,29 +1,41 @@
 """End-to-end tests against a live Chrome Bridge.
 
 These tests are skipped automatically when the bridge isn't reachable
-(see ``conftest.py``). They use only public, login-free pages so they
-work for any developer.
+(see ``conftest.py``). Page behavior is exercised against a tiny local
+site so third-party content changes cannot make the suite flaky.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from bridge_client import BridgePage, ElementNotFoundError, StaleRefError, Tab, TabGoneError
+from bridge_client import (
+    BridgeError,
+    BridgePage,
+    ElementNotFoundError,
+    ForegroundRequiredError,
+    StaleRefError,
+    Tab,
+    TabGoneError,
+    TabScopeMismatchError,
+)
 
-EXAMPLE = "https://example.com"
+EXAMPLE = ""
 
 
 @pytest.fixture(scope="module")
 def local_site():
-    """A tiny same-origin HTTP server for the fetch tests.
+    """A tiny same-origin HTTP server for browser integration tests.
 
-    They used to hit httpbin.org, which made a red suite mean "someone else's
-    service is slow" as often as "the bridge is broken".
+    The suite used to depend on example.com and httpbin.org. A red suite then
+    meant "someone else's page changed" as often as "the bridge is broken".
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -32,7 +44,12 @@ def local_site():
                 body = json.dumps({"path": self.path, "ok": True}).encode()
                 ctype = "application/json"
             else:
-                body = b"<!doctype html><h1>local</h1>"
+                body = (
+                    b"<!doctype html><html><head><title>Example Domain</title></head>"
+                    b"<body><h1>Example Domain</h1>"
+                    b"<p>This deterministic page is reserved for Chrome Bridge tests.</p>"
+                    b'<p><a href="/more">More information</a></p></body></html>'
+                )
                 ctype = "text/html"
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -54,11 +71,20 @@ def local_site():
         thread.join(timeout=5)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def example_site(local_site: str) -> str:
+    """Point all former example.com tests at the deterministic local page."""
+    global EXAMPLE  # noqa: PLW0603 - fixture initializes the module test URL
+    EXAMPLE = f"{local_site}/"
+    return EXAMPLE
+
+
 @pytest.mark.integration
 class TestBridgePublicSites:
     @pytest.fixture(scope="class")
-    def page(self) -> BridgePage:
-        return BridgePage()
+    def page(self):
+        with BridgePage() as page:
+            yield page
 
     def test_server_running(self, page: BridgePage) -> None:
         assert page.is_server_running()
@@ -69,7 +95,7 @@ class TestBridgePublicSites:
     def test_status_reports_a_version(self, page: BridgePage) -> None:
         assert page.status().get("server_version")
 
-    def test_browse_and_eval_example_com(self, page: BridgePage) -> None:
+    def test_browse_and_eval_example_page(self, page: BridgePage) -> None:
         title = page.browse_and_eval(url=EXAMPLE, expression="document.title", timeout=30000)
         assert title == "Example Domain"
 
@@ -88,8 +114,8 @@ class TestBridgePublicSites:
         assert page.evaluate("document.title") == "Example Domain"
 
     def test_get_cookies_returns_list(self, page: BridgePage) -> None:
-        cookies = page.get_cookies(domain="example.com")
-        # example.com sets no cookies; the API still has to return a list.
+        cookies = page.get_cookies(domain="127.0.0.1")
+        # The local site sets no cookies; the API still has to return a list.
         assert isinstance(cookies, list)
 
 
@@ -98,8 +124,9 @@ class TestSessions:
     """The tab-bound API: typed verbs working inside a browse session."""
 
     @pytest.fixture(scope="class")
-    def page(self) -> BridgePage:
-        return BridgePage()
+    def page(self):
+        with BridgePage() as page:
+            yield page
 
     def test_tab_context_manager_closes_the_tab(self, page: BridgePage) -> None:
         """Assert what the bridge controls, not Chrome's scheduling.
@@ -136,13 +163,13 @@ class TestSessions:
 
     def test_typed_verbs_target_the_session_tab(self, page: BridgePage) -> None:
         """Before tab_id plumbing, these silently hit the shared managed tab."""
-        page.navigate("https://example.org")  # poison the managed tab
+        page.navigate(f"{EXAMPLE}?managed")  # poison the managed tab
         with page.tab(EXAMPLE) as tab:
             assert tab.has_element("h1")
             assert (tab.get_element_text("h1") or "").strip() == "Example Domain"
             assert tab.wait_for_element("h1", timeout=5) == "found"
             assert tab.get_elements_count("p") >= 1
-            assert "example.com" in tab.get_url()
+            assert tab.get_url().startswith(EXAMPLE)
 
     def test_named_session_is_reused_not_duplicated(self, page: BridgePage) -> None:
         first = page.browse_open(EXAMPLE, name="pytest-session")
@@ -156,15 +183,47 @@ class TestSessions:
 
     def test_list_tabs_sees_the_session(self, page: BridgePage) -> None:
         with page.tab(EXAMPLE) as tab:
-            found = [t for t in page.list_tabs("example.com") if t["tab_id"] == tab.tab_id]
+            found = [t for t in page.list_tabs("127.0.0.1") if t["tab_id"] == tab.tab_id]
             assert found and found[0]["bridge_owned"] is True
+
+    def test_other_scope_cannot_target_the_session(self, page: BridgePage) -> None:
+        with page.tab(EXAMPLE) as tab:
+            intruder = BridgePage(tab_id=tab.tab_id)
+            with pytest.raises(TabScopeMismatchError):
+                intruder.evaluate("document.title")
+
+    def test_parallel_scopes_open_and_clean_independently(self) -> None:
+        scope_a = BridgePage()
+        scope_b = BridgePage()
+        baseline_user_tabs = {
+            tab["tab_id"] for tab in scope_a.list_tabs() if not tab.get("bridge_owned")
+        }
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                opened_a, opened_b = [
+                    future.result()
+                    for future in (
+                        pool.submit(scope_a.browse_open, EXAMPLE, settle_ms=0),
+                        pool.submit(scope_b.browse_open, EXAMPLE, settle_ms=0),
+                    )
+                ]
+            assert opened_a["tab_id"] != opened_b["tab_id"]
+            scope_a.close_owned_tabs()
+            remaining = scope_b.list_tabs()
+            assert any(tab["tab_id"] == opened_b["tab_id"] for tab in remaining)
+            assert baseline_user_tabs <= {tab["tab_id"] for tab in remaining}
+        finally:
+            for scope in (scope_a, scope_b):
+                with contextlib.suppress(BridgeError):
+                    scope.close_owned_tabs()
 
 
 @pytest.mark.integration
 class TestAgentPrimitives:
     @pytest.fixture(scope="class")
-    def page(self) -> BridgePage:
-        return BridgePage()
+    def page(self):
+        with BridgePage() as page:
+            yield page
 
     def test_snapshot_lists_interactive_elements_with_refs(self, page: BridgePage) -> None:
         with page.tab(EXAMPLE) as tab:
@@ -307,13 +366,13 @@ class TestReactForms:
         assert tab.evaluate("window.__inputEvents") >= 1
 
     def test_input_text_bypasses_the_value_tracker(self) -> None:
-        with BridgePage().tab(EXAMPLE) as tab:
+        with BridgePage() as page, page.tab(EXAMPLE) as tab:
             assert tab.evaluate(self.INSTALL_TRACKER) == "ready"
             tab.input_text("#tracked", "hello world")
             self._assert_tracker_was_bypassed(tab, "hello world")
 
     def test_act_fill_bypasses_the_value_tracker(self) -> None:
-        with BridgePage().tab(EXAMPLE) as tab:
+        with BridgePage() as page, page.tab(EXAMPLE) as tab:
             assert tab.evaluate(self.INSTALL_TRACKER) == "ready"
             snap = tab.snapshot()
             ref = next(e["ref"] for e in snap["elements"] if e["tag"] == "input")
@@ -342,8 +401,7 @@ class TestInputScrollAndCdp:
     # they stay independent.
     @pytest.fixture(scope="class")
     def _session(self):
-        page = BridgePage()
-        with page.tab(EXAMPLE) as tab:
+        with BridgePage() as page, page.tab(EXAMPLE) as tab:
             yield tab
 
     @pytest.fixture
@@ -428,44 +486,47 @@ class TestInputScrollAndCdp:
         )
         return rect["left"] + rect["width"] / 2, rect["top"] + rect["height"] / 2
 
-    def test_cdp_mouse_delivers_a_trusted_click(self, tab: Tab) -> None:
-        """The entire point of cdp_mouse: events synthetic dispatch can't fake.
-
-        Anything gated on `event.isTrusted` (native menus, HTML5 drag) only
-        responds to this path.
-        """
+    def test_cdp_mouse_click_requires_foreground_opt_in(self, tab: Tab) -> None:
         cx, cy = self._centre(tab, "#btn")
-        tab.cdp_mouse("click", x=cx, y=cy)
-        trusted = tab.evaluate("window.__log.filter(e => e[0] === 'click' && e[1] === true).length")
-        assert trusted >= 1, tab.evaluate("JSON.stringify(window.__log)")
+        with pytest.raises(ForegroundRequiredError):
+            tab.cdp_mouse("click", x=cx, y=cy)
 
-    def test_cdp_mouse_rightclick_and_move(self, tab: Tab) -> None:
+    def test_cdp_mouse_move_stays_background_and_rightclick_is_guarded(self, tab: Tab) -> None:
         cx, cy = self._centre(tab, "#btn")
         tab.cdp_mouse("move", x=cx, y=cy)
-        tab.cdp_mouse("rightclick", x=cx, y=cy)
-        assert (
-            tab.evaluate("window.__log.some(e => e[0] === 'contextmenu' && e[1] === true)") is True
-        )
+        with pytest.raises(ForegroundRequiredError):
+            tab.cdp_mouse("rightclick", x=cx, y=cy)
 
+    def test_activate_tab_requires_foreground_opt_in(self, tab: Tab) -> None:
+        """Foreground activation is rejected unless the caller explicitly opts in."""
+        with pytest.raises(ForegroundRequiredError):
+            tab.activate_tab()
+
+    @pytest.mark.skipif(
+        os.environ.get("CHROME_BRIDGE_ALLOW_FOREGROUND_TESTS") != "1",
+        reason="foreground input tests require explicit opt-in",
+    )
     def test_activate_tab_reports_and_restores_the_displaced_tab(self, tab: Tab) -> None:
-        """`reload_self` is the only public verb with no E2E test: it tears
-        down every open session, so it can't run inside a suite. It is
-        exercised constantly in practice — the server's file watcher calls it
-        on every edit to extension/."""
-        page = BridgePage()
-        info = tab.activate_tab()
+        page = BridgePage(scope_id=tab.scope_id)
+        info = tab.activate_tab(allow_foreground=True)
         assert info["activated"] == tab.tab_id
         assert [t["tab_id"] for t in page.list_tabs() if t["active"]].count(tab.tab_id) == 1
         if info["previous"]:
-            BridgePage(tab_id=info["previous"]).activate_tab()
+            BridgePage(tab_id=info["previous"], scope_id=tab.scope_id).activate_tab(
+                allow_foreground=True
+            )
             actives = [t["tab_id"] for t in page.list_tabs() if t["active"]]
             assert info["previous"] in actives
 
+    @pytest.mark.skipif(
+        os.environ.get("CHROME_BRIDGE_ALLOW_FOREGROUND_TESTS") != "1",
+        reason="foreground input tests require explicit opt-in",
+    )
     def test_cdp_mouse_puts_the_users_tab_back(self, tab: Tab) -> None:
-        page = BridgePage()
+        page = BridgePage(scope_id=tab.scope_id)
         before = sorted(t["tab_id"] for t in page.list_tabs() if t["active"])
         cx, cy = self._centre(tab, "#btn")
-        tab.cdp_mouse("click", x=cx, y=cy)
+        tab.cdp_mouse("click", x=cx, y=cy, activate=True)
         after = sorted(t["tab_id"] for t in page.list_tabs() if t["active"])
         assert after == before, "cdp_mouse left the user looking at a different tab"
 

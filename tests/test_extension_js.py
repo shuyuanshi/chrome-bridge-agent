@@ -178,7 +178,7 @@ def test_opening_a_tab_survives_having_no_browser_window(source: str) -> None:
     assert "function newBackgroundTab" in source
     assert "no current window" in source.lower()
     assert "chrome.windows.create" in source
-    assert "NO_BROWSER_WINDOW" in source
+    assert "NO_AUTOMATION_WINDOW" in source
 
 
 def test_closing_a_tab_does_not_block_on_window_teardown(source: str) -> None:
@@ -188,7 +188,7 @@ def test_closing_a_tab_does_not_block_on_window_teardown(source: str) -> None:
     discard = source.split("async function discardBridgeTab")[1].split(
         "chrome.tabs.onRemoved.addListener"
     )[0]
-    close = source.split("async function cmdBrowseClose")[1][:600]
+    close = source.split("async function cmdBrowseClose")[1][:1200]
     assert "Promise.race" in discard
     assert "chrome.tabs.remove" in discard
     assert "discardBridgeTab" in close
@@ -206,6 +206,12 @@ def test_waits_are_driven_from_the_service_worker(source: str) -> None:
 def test_state_survives_service_worker_eviction(source: str) -> None:
     assert "chrome.storage.session" in source
     assert "chrome.tabs.onRemoved" in source
+    assert "chrome.tabs.onReplaced" in source
+
+
+def test_cleanup_never_directly_closes_a_window(source: str) -> None:
+    assert "chrome.windows.remove" not in source
+    assert "refusing to remove a tab from a user or foreground window" in source
 
 
 def test_reconnect_uses_backoff(source: str) -> None:

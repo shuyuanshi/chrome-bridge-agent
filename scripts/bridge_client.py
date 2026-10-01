@@ -17,9 +17,14 @@ Three ways to use it:
         tab.click_element("#filter")
         rows = tab.evaluate("document.querySelectorAll('tr').length")
 
-    # 3. the shared managed tab (legacy; racy if two scripts run at once)
+    # 3. a scope-local managed tab
     page.navigate("https://example.com")
     page.evaluate("document.title")
+
+Wrap a complete task in ``with BridgePage() as page:`` to close every tab
+opened by that page's ownership scope on success or failure. Separate page
+instances get separate scopes, so parallel agents cannot reuse or clean up one
+another's tabs.
 
 Set CHROME_BRIDGE_DEBUG=1 to log every RPC (method, params, elapsed, reply) from
 the bridge logger to stderr. Cookie replies are redacted, but *parameters* are
@@ -29,10 +34,11 @@ logged verbatim — so don't leave it on for a run that types a credential.
 from __future__ import annotations
 
 import base64
-import contextlib
+import hashlib
 import json
 import logging
 import os
+import secrets
 import sys
 import time
 from typing import Any
@@ -127,6 +133,24 @@ class NavigationTimeoutError(BridgeError):
     code = "NAV_TIMEOUT"
 
 
+class ForegroundRequiredError(BridgeError):
+    """The requested action would bring Chrome to the foreground."""
+
+    code = "FOREGROUND_REQUIRED"
+
+
+class TabNotOwnedError(BridgeError):
+    """A close targeted a user tab rather than a tab created by this scope."""
+
+    code = "TAB_NOT_OWNED"
+
+
+class TabScopeMismatchError(BridgeError):
+    """An operation targeted a tab owned by another bridge scope."""
+
+    code = "TAB_SCOPE_MISMATCH"
+
+
 _ERROR_TYPES: dict[str, type[BridgeError]] = {
     cls.code: cls
     for cls in (
@@ -139,8 +163,34 @@ _ERROR_TYPES: dict[str, type[BridgeError]] = {
         JSEvalError,
         StaleRefError,
         NavigationTimeoutError,
+        ForegroundRequiredError,
+        TabNotOwnedError,
+        TabScopeMismatchError,
     )
 }
+
+
+def _make_scope_id(value: str | None = None) -> str:
+    """Return a short opaque wire ID; explicit names are stable but not exposed."""
+    raw = value or os.environ.get("CHROME_BRIDGE_SCOPE")
+    # Reserved upgrade escape hatch for tabs persisted by pre-2.1 extensions.
+    if raw == "legacy":
+        return raw
+    if raw and raw.startswith("cb-") and len(raw) == 27:
+        return raw
+    if not raw:
+        raw = secrets.token_urlsafe(24)
+    return "cb-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _validate_session_name(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("session name must be a string")
+    if not value.strip() or value.isdecimal() or "\x1f" in value:
+        raise ValueError(
+            "session name must be a non-empty, non-numeric string without control separators"
+        )
+    return value
 
 
 def _raise_for(error: Any) -> None:
@@ -162,7 +212,7 @@ class BridgePage:
     on the client side.
 
     When ``tab_id`` is set (see :meth:`tab`), every command targets that tab
-    instead of the shared managed tab.
+    instead of this scope's managed tab.
     """
 
     def __init__(
@@ -170,13 +220,40 @@ class BridgePage:
         bridge_url: str = BRIDGE_URL,
         *,
         tab_id: str | None = None,
+        scope_id: str | None = None,
         token: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self._bridge_url = bridge_url
         self._tab_id = tab_id
+        self._scope_id = _make_scope_id(scope_id)
         self._token = token if token is not None else read_token()
         self._timeout = timeout
+
+    @property
+    def scope_id(self) -> str:
+        """Opaque ownership scope used to isolate tabs from parallel agents."""
+        return self._scope_id
+
+    def __enter__(self) -> BridgePage:
+        return self
+
+    def __exit__(self, exc_type: object, _exc: object, _tb: object) -> None:
+        try:
+            result = self.close_owned_tabs()
+        except BridgeError:
+            if exc_type is None:
+                raise
+            _LOG.warning("could not clean up Chrome Bridge scope %s", self._scope_id)
+            return
+        refused = result.get("refused") or []
+        remaining = result.get("remaining") or []
+        if refused or remaining:
+            count = len(remaining) or len(refused)
+            message = f"Chrome left {count} bridge-owned tab(s) open after task cleanup"
+            if exc_type is None:
+                raise BridgeError(message, code="TAB_CLEANUP_FAILED", detail=result)
+            _LOG.warning("%s", message)
 
     # ─── internal RPC ───────────────────────────────────────────
 
@@ -191,6 +268,7 @@ class BridgePage:
         payload: dict[str, Any] = {
             "role": "cli",
             "method": method,
+            "scope_id": self._scope_id,
             "deadline_ms": int(deadline * 1000),
         }
         merged = dict(params or {})
@@ -280,9 +358,9 @@ class BridgePage:
             with page.tab("https://example.com") as t:
                 t.click_element("#go")
 
-        Pass ``name=`` to reuse the same tab across runs instead of opening a
-        new one each time. A *named* tab is deliberately left open when the
-        block exits — call ``.close()`` to dispose of it.
+        Pass ``name=`` to reuse the same tab across calls in this scope instead
+        of opening a new one each time. A *named* tab is deliberately left open
+        when the block exits — call ``.close()`` to dispose of it.
         """
         info = self.browse_open(
             url,
@@ -294,6 +372,7 @@ class BridgePage:
         return Tab(
             self._bridge_url,
             tab_id=info["tab_id"],
+            scope_id=self._scope_id,
             token=self._token,
             timeout=self._timeout,
             url=info.get("url"),
@@ -301,8 +380,9 @@ class BridgePage:
         )
 
     def list_sessions(self) -> list[dict]:
-        """Named sessions the extension is still holding open."""
-        return self._call("list_sessions") or []
+        """Named sessions owned by this page's scope."""
+        result = self._call("list_sessions")
+        return result if isinstance(result, list) else []
 
     def list_tabs(self, url_contains: str = "") -> list[dict]:
         """Every tab in the browser, optionally filtered by URL substring.
@@ -310,7 +390,42 @@ class BridgePage:
         Lets a script attach to a tab the *user* already has open:
         ``BridgePage(tab_id=page.list_tabs("github.com")[0]["tab_id"])``.
         """
-        return self._call("list_tabs", {"url_contains": url_contains}) or []
+        result = self._call("list_tabs", {"url_contains": url_contains})
+        return result if isinstance(result, list) else []
+
+    def close_owned_tabs(self, *, wait: bool = True, timeout: float = 10.0) -> dict:
+        """Close every bridge-created tab owned by this scope, and no others.
+
+        This is idempotent. ``wait`` polls tabs whose close was accepted but
+        not yet confirmed. Refused closes always raise; ``wait=False`` returns
+        accepted pending/remaining tabs without treating them as a failure.
+        """
+        result = self._call("close_owned_tabs", {}, timeout=max(timeout, 1.0) + 5)
+        if not isinstance(result, dict):
+            result = {}
+        pending = {str(tab_id) for tab_id in result.get("pending", [])}
+        if wait and pending:
+            deadline = time.monotonic() + max(0.0, timeout)
+            while pending and time.monotonic() < deadline:
+                owned = {
+                    str(tab["tab_id"])
+                    for tab in self.list_tabs()
+                    if tab.get("bridge_owned_by_scope")
+                }
+                pending &= owned
+                if pending:
+                    time.sleep(0.1)
+        result["remaining"] = [
+            str(tab["tab_id"]) for tab in self.list_tabs() if tab.get("bridge_owned_by_scope")
+        ]
+        if result.get("refused") or (wait and result["remaining"]):
+            count = len(result["remaining"]) or len(result.get("refused") or [])
+            raise BridgeError(
+                f"Chrome left {count} bridge-owned tab(s) open after cleanup",
+                code="TAB_CLEANUP_FAILED",
+                detail=result,
+            )
+        return result
 
     # ─── navigation ─────────────────────────────────────────────
 
@@ -633,19 +748,17 @@ class BridgePage:
         y2: float | None = None,
         button: str = "left",
         *,
-        activate: bool = True,
+        activate: bool = False,
     ) -> Any:
         """Trusted native mouse input (CDP Input). action: click / rightclick / move / drag.
 
         Use when synthetic events are ignored — native context menus, HTML5
         drag-and-drop, and widgets that check ``event.isTrusted``.
 
-        **This is the one verb that touches the foreground.** Chrome does not
-        reliably deliver press/release to a tab that isn't visible — pointer
-        *moves* always arrive, but a click is dropped unless the tab's renderer
-        still has a live surface. So the tab is raised for the duration and the
-        previously active tab is restored afterwards. ``activate=False`` skips
-        that, at the risk of the click silently going nowhere.
+        Background pointer moves work normally. Click/drag on the minimized
+        automation window raises :class:`ForegroundRequiredError` by default;
+        ``activate=True`` is an explicit foreground opt-in and should be used
+        only with the user's consent.
         """
         return self._call(
             "cdp_mouse",
@@ -660,12 +773,12 @@ class BridgePage:
             },
         )
 
-    def activate_tab(self) -> dict:
-        """Bring this tab to the front. Returns {activated, previous}.
+    def activate_tab(self, *, allow_foreground: bool = False) -> dict:
+        """Bring this tab to the front only with explicit foreground opt-in.
 
         ``BridgePage(tab_id=previous).activate_tab()`` puts the old one back.
         """
-        return self._call("activate_tab", {})
+        return self._call("activate_tab", {"allow_foreground": allow_foreground})
 
     # ─── file upload ────────────────────────────────────────────
 
@@ -728,6 +841,8 @@ class BridgePage:
 
         Prefer :meth:`tab` — it closes the tab for you.
         """
+        if name is not None:
+            _validate_session_name(name)
         params: dict[str, Any] = {"url": url, "timeout": timeout, "settle_ms": settle_ms}
         if name:
             params["name"] = name
@@ -770,15 +885,17 @@ class BridgePage:
         tab_info = self.browse_open(url, timeout=timeout)
         tab_id = tab_info["tab_id"]
         try:
-            return self.browse_do(
+            result = self.browse_do(
                 tab_id, expression, wait_selector=wait_selector, wait_timeout=wait_timeout
             )
-        finally:
-            # A failure while closing must not mask the real error.
+        except BaseException:
             try:
                 self.browse_close(tab_id)
             except BridgeError:
                 _LOG.warning("could not close browse tab %s", tab_id)
+            raise
+        self.browse_close(tab_id)
+        return result
 
     # ─── no-ops (kept for API compatibility) ────────────────────
 
@@ -842,7 +959,7 @@ class Tab(BridgePage):
     def __enter__(self) -> Tab:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(self, exc_type: object, _exc: object, _tb: object) -> None:
         if self.name:
             # A named session is meant to outlive the block — that is the whole
             # reason to name it. Call close() explicitly to dispose of one.
@@ -850,6 +967,8 @@ class Tab(BridgePage):
         try:
             self.close()
         except BridgeError:
+            if exc_type is None:
+                raise
             _LOG.warning("could not close tab %s", self._tab_id)
 
     def __repr__(self) -> str:
@@ -886,7 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
     """One-shot bridge calls from a shell, so an agent needn't write a .py file.
 
     chrome-bridge eval 'document.title' --url https://example.com
-    chrome-bridge snapshot --session dash
+    chrome-bridge --scope task-a snapshot --session dash
     chrome-bridge fetch https://internal/api/x --json
     """
     import argparse
@@ -901,11 +1020,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     common.add_argument(
         "--session",
+        type=_validate_session_name,
         default=argparse.SUPPRESS,
         help="named session to use (kept open). Combine with --url to create one.",
     )
     common.add_argument(
         "--tab-id", default=argparse.SUPPRESS, help="target an existing tab id (see `list-tabs`)"
+    )
+    common.add_argument(
+        "--scope",
+        default=argparse.SUPPRESS,
+        help="stable task/agent ownership scope (required for cross-process sessions and cleanup)",
     )
 
     parser = argparse.ArgumentParser(
@@ -961,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
     add("list-tabs", "every open tab")
     add("list-sessions", "named bridge sessions")
     add("reload", "reload the extension (after editing extension/)")
+    add("cleanup", "close every bridge-owned tab in this scope")
 
     p_close = add("close", "close a named session or tab id")
     p_close.add_argument("target")
@@ -969,7 +1095,19 @@ def main(argv: list[str] | None = None) -> int:
     bridge_url = getattr(args, "bridge_url", BRIDGE_URL)
     open_url = getattr(args, "url", None)
     session = getattr(args, "session", None)
-    page = BridgePage(bridge_url, tab_id=getattr(args, "tab_id", None))
+    scope = getattr(args, "scope", None)
+    explicit_scope = bool(scope or os.environ.get("CHROME_BRIDGE_SCOPE"))
+    if (session or args.cmd in {"close", "cleanup", "list-sessions"}) and not (
+        scope or os.environ.get("CHROME_BRIDGE_SCOPE")
+    ):
+        parser.error(
+            "--session, close, cleanup, and list-sessions require --scope or CHROME_BRIDGE_SCOPE"
+        )
+    page = BridgePage(
+        bridge_url,
+        tab_id=getattr(args, "tab_id", None),
+        scope_id=scope,
+    )
 
     if args.cmd == "status":
         print(json.dumps(page.status(), indent=2))
@@ -980,15 +1118,28 @@ def main(argv: list[str] | None = None) -> int:
 
     target: BridgePage = page
     temp: Tab | None = None
+    transient_owner: BridgePage | None = None
+    out: Any = None
+    command_error: BaseException | None = None
     try:
         if open_url:
-            temp = page.tab(open_url, name=session)
+            # An anonymous one-shot gets its own ownership scope even when the
+            # caller also supplied a persistent --scope. Its popup descendants
+            # can then be cleaned without deleting that scope's named sessions.
+            owner = page
+            if not session:
+                transient_owner = BridgePage(
+                    bridge_url,
+                    scope_id=f"oneshot-{secrets.token_urlsafe(24)}",
+                )
+                owner = transient_owner
+            temp = owner.tab(open_url, name=session)
             target = temp
         elif session:
-            target = BridgePage(bridge_url, tab_id=session)
+            target = BridgePage(bridge_url, tab_id=session, scope_id=page.scope_id)
 
         if args.cmd == "eval":
-            out: Any = target.evaluate(args.expression)
+            out = target.evaluate(args.expression)
         elif args.cmd == "text":
             out = target.read_text(args.selector)
         elif args.cmd == "snapshot":
@@ -1013,19 +1164,74 @@ def main(argv: list[str] | None = None) -> int:
             out = page.list_tabs()
         elif args.cmd == "list-sessions":
             out = page.list_sessions()
+        elif args.cmd == "cleanup":
+            out = page.close_owned_tabs()
         elif args.cmd == "close":
             out = page.browse_close(args.target)
         else:  # pragma: no cover - argparse enforces this
             parser.error(f"unknown command {args.cmd}")
             return 2
-    except BridgeError as e:
-        print(json.dumps({"error": e.code, "message": str(e), "detail": e.detail}), file=sys.stderr)
-        return 1
-    finally:
-        # A named session stays open on purpose; an anonymous temp tab doesn't.
-        if temp is not None and not session:
-            with contextlib.suppress(BridgeError):
+    except BaseException as e:
+        command_error = e
+
+    cleanup_error: BridgeError | None = None
+    if transient_owner is not None:
+        if temp is not None:
+            try:
                 temp.close()
+            except BridgeError as e:
+                cleanup_error = e
+        try:
+            transient_owner.close_owned_tabs()
+        except BridgeError as e:
+            cleanup_error = e
+        else:
+            # Scope cleanup is authoritative and catches popup descendants too.
+            cleanup_error = None
+    elif (
+        not explicit_scope
+        and not session
+        and args.cmd in {"eval", "text", "snapshot", "fetch", "screenshot"}
+    ):
+        try:
+            page.close_owned_tabs()
+        except BridgeError as e:
+            cleanup_error = e
+
+    if command_error is not None:
+        if not isinstance(command_error, BridgeError):
+            if cleanup_error is not None:
+                _LOG.warning(
+                    "cleanup also failed after %s: %s",
+                    type(command_error).__name__,
+                    cleanup_error,
+                )
+            raise command_error
+        payload = {
+            "error": command_error.code,
+            "message": str(command_error),
+            "detail": command_error.detail,
+        }
+        if cleanup_error is not None:
+            payload["cleanup_error"] = {
+                "code": cleanup_error.code,
+                "message": str(cleanup_error),
+                "detail": cleanup_error.detail,
+            }
+        print(json.dumps(payload), file=sys.stderr)
+        return 1
+    if cleanup_error is not None:
+        print(
+            json.dumps(
+                {
+                    "error": cleanup_error.code,
+                    "message": str(cleanup_error),
+                    "detail": cleanup_error.detail,
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     print(out if isinstance(out, str) else json.dumps(out, indent=2, ensure_ascii=False))
     return 0
